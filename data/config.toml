@@ -1,0 +1,30 @@
+[paths]
+input_csv = "path/to/input.csv"
+input_json = "path/to/input.json"
+
+[random]
+seed = 42
+
+[time]
+historic_start = 1608 # First year for historic age cohorts
+historic_end = 2021   # Last year for historic age cohorts
+future_end = 2071     # Last year for the future age cohorts
+
+[dwelling_stock]
+dwelling_types = ['apartments', 'mobile', 'single_attached', 'single_detached']
+cohort_definitions = ["pre_1945", "1945_1970", "1970_1990", "post_1990"]
+neud_cohorts = [
+    "1608-1946",
+    "1946-1960",
+    "1961-1977",
+    "1978-1983",
+    "1984-1995",
+    "1996-2000",
+    "2001-2005",
+    "2006-2010",
+    "2011-2015",
+    "2016-2020",
+] # Based on NEUD definition
+
+cov = 0.2
+cv_population = 0.0012
