@@ -1,0 +1,6 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# To install, run the following command in root:
+# pip install --editable . --use-pep517
