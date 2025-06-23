@@ -10,6 +10,16 @@ historic_start = 1608 # First year for historic age cohorts
 historic_end = 2021   # Last year for historic age cohorts
 future_end = 2071     # Last year for the future age cohorts
 
+[census]
+    [census.type_map]
+    # other replacements are automatic in cleaning process
+    movable = "mobile"
+    apartment = "apartments"
+    fewer = "apartment<5"
+    more = "apartment>5"
+    "semi-" = "semi_detached"
+    duplex = "apartment_duplex"
+
 [dwelling_stock]
 dwelling_types = ['apartments', 'mobile', 'single_attached', 'single_detached']
 cohort_definitions = ["pre_1945", "1945_1970", "1970_1990", "post_1990"]
