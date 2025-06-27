@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional, Dict
 from uncertimety.logger import init_logger
 from IPython.display import display  # FIXME only for temp test
-
+from datetime import datetime
+from dateutil import relativedelta
 
 logger = init_logger()
 
@@ -65,9 +66,9 @@ def normalize_vintage_label(vintage: str, sep="-") -> str:
     elif "after" in vintage or ">" in vintage:
         return vintage.split(sep)[0].strip() + "+"
     elif "1" in vintage.split(sep):
-        # covers the case of e.g., 1986-1, 1996-1, 1986 (1)
-        # FIXME I actually might want to keep the one, depending on future use case in dataprep.py TODO: see dmfa_dataprep for this
-        return vintage.split(sep)[0].strip()
+        # covers the case of e.g., 1986-1, 1996-1, 1986 (1), 1961-1971(1)
+        # here, we keep the '1' as a sign that the last year is incomplete - it will have to be split when harmonizing the vintages
+        return sep.join(list(map(str.strip, vintage.split(sep))))
     else:
         return vintage
 
@@ -347,3 +348,258 @@ def overwrite_census_dataset(
     # TODO check that other_dwelling equals the sum of relevant dwellings, that apartments is approx the sum of apartments, that total makes sense, etc. this could be its own function later on
 
     return dataframes
+
+
+def check_year(year) -> int:
+    """
+    Validates and converts a year to int.
+
+    Accepts strings or integers, checks for valid range (1608–2149).
+
+    Args:
+        year (str or int): The year value.
+
+    Returns:
+        int: A validated, coerced year.
+
+    Raises:
+        TypeError: If input is not str or int.
+        ValueError: If value is not within accepted year range.
+    """
+    try:
+        year_int = int(year)
+    except (ValueError, TypeError):
+        raise TypeError(
+            f"Expected int or str convertible to int, got {type(year).__name__}: {year}"
+        )
+
+    if year_int < 0:
+        raise ValueError(f"Year must be non-negative, got: {year}")
+    elif year_int not in range(1608, 2150):
+        raise ValueError(
+            f"Encountered unexpected year (must be 1608–2149), got: {year_int}"
+        )
+
+    return year_int
+
+
+def round_to_next_5(year) -> int:
+    """
+    Rounds a year up to the next multiple of 5.
+
+    Args:
+        year (str or int): A valid year.
+
+    Returns:
+        int: The next multiple of 5 above the given year.
+    """
+    year = check_year(year)
+    return ((year // 5) + 1) * 5
+
+
+def infer_last_full_year(census_year) -> int:
+    """
+    Infers the last full cohort year based on the given census year.
+
+    This is used to cap cohort ranges like '1986+' or partial census intervals.
+
+    Examples: #FIXME fix these examples
+        - 1986 → 1985 (→ 1986-1990 cohort)
+        - 1996 → 1995 (→ 1986-1995 span)
+        - 2001 → 2000 (→ 2001-2005 cohort)
+
+    Args:
+        census_year (str or int): Census year to use as cutoff.
+
+    Returns:
+        int: Last full year (typically ending in a 0 or 5).
+    """
+    census_year = check_year(census_year)
+    return ((census_year - 1) // 5) * 5
+
+
+def get_monthly_activity(inactive_months: int = None) -> list:
+    """_summary_
+
+        the number of months with no construction activity, i.e., no new dwellings built, starting in January. is passed to get_monthly_activity, which returns a list of 12 floats summing to 1, representing the fraction of annual construction assumed to occur in each month. Default is uniform (1/12 per month).
+
+    Args:
+        inactive_months (int, optional): _description_. Defaults to None.
+
+    Raises:
+        ValueError: _description_
+
+    Returns:
+        list: _description_
+    """
+
+    if inactive_months is None:
+        inactive_months = 0
+
+    if inactive_months < 0 or inactive_months > 11:
+        msg = f"inactive_months must be an int between 0 and 11, received {inactive_months}"
+        raise ValueError(msg)
+
+    active_months = 12 - inactive_months
+    return [0] * inactive_months + [1 / active_months] * active_months
+
+
+def get_vintage_shares(
+    vintage_label: str,
+    sep: str = "-",
+    inactive_months: int = None,
+    census_month: int = 5,
+) -> list[float]:
+    """
+    Calculates the proportion of construction in a vintage range that:
+    - occurred over full years
+    - occurred in the final (incomplete) census year
+
+    Args:
+        vintage_label (str): e.g. "1946-1960"
+        sep (str): separator, typically "-"
+        inactive_months (int): number of months with no construction in a year
+        census_month (int): the month (Jan = 1, May = 5) in which the census takes place in the incomplete census year
+
+    Returns:
+        list[float]: [full_years_share, census_year_share]
+    """
+
+    monthly_activity = get_monthly_activity(inactive_months=inactive_months)
+
+    try:
+        start_str, end_str = vintage_label.strip().split(sep)[:2]
+        start_year = datetime.strptime(start_str.strip(), "%Y")
+        end_year = datetime.strptime(end_str.strip(), "%Y")
+    except (ValueError, IndexError) as err:
+        msg = (
+            f"Invalid vintage label '{vintage_label}'; expected format 'YYYY{sep}YYYY'."
+        )
+        logger.error(msg)
+        raise ValueError(msg) from err
+
+    full_years = relativedelta.relativedelta(end_year, start_year).years
+    if full_years < 0:
+        msg = f"Start year {start_str} must be before end year {end_str} in label."
+        logger.error(msg)
+        raise ValueError(msg)
+
+    # Sum monthly activity in the final (census) year; January to last month before census in the incomplete year, defaults to may
+    census_year_share = sum(monthly_activity[:census_month])
+
+    full_years_share = full_years * sum(monthly_activity)  # full years * 1
+    total = full_years_share + census_year_share
+
+    return [full_years_share / total, census_year_share / total]
+
+
+def extract_year_from_token(token: str, symbol: str) -> int:
+    """
+    Extracts a year from a token like '<1920' or '1986+' by splitting on symbol.
+    """
+    # TODO check if applications in other functions in dataprep.py
+    try:
+        year_str = token.split(symbol)[0] if symbol == "+" else token.split(symbol)[1]
+        return check_year(int(year_str))
+    except Exception as err:
+        raise ValueError(
+            f"Could not extract year from '{token}' using symbol '{symbol}'"
+        ) from err
+
+
+def parse_single_vintage(
+    label: str, census_year: int, sep: str = "-", model_start: int = 1608
+) -> tuple[list[tuple[int, int]], list[float]]:
+    # FIXME: rename model_start? default to zero or None?
+    """
+    Parses a single vintage label into [start, end] intervals and associated shares.
+
+    Handles:
+    - '<1920' → (model_start, 1920)
+    - '1986+' → (1986, round_to_next_5(census_year))
+    - '1991-1' or '1971-1981-1' → split vintage
+    - 'total' → (model_start, round_to_next_5(census_year))
+
+    Returns:
+        tuple: (list of (start, end), list of shares)
+    """
+    label = str(label).strip()
+    census_year = check_year(census_year)
+
+    intervals = []
+    shares = [1.0]
+
+    # === Special cases first
+    if label.lower() == "total":
+        intervals = [
+            (model_start, round_to_next_5(census_year))
+        ]  # FIXME might need to be from model start to census year directly?
+        return intervals, shares
+
+    if label.startswith("<"):
+        try:
+            year = extract_year_from_token(label, "<")
+            intervals = [(model_start, year)]
+            return intervals, shares
+        except ValueError as err:
+            logger.error(err)
+            return [], []
+
+    if label.endswith("+"):
+        try:
+            year = extract_year_from_token(label, "+")
+            intervals = [(year, round_to_next_5(census_year))]
+            return intervals, shares
+        except ValueError as err:
+            logger.error(err)
+            return [], []
+
+    # === Incomplete census year (e.g., 1991-1, 1971-1981-1)
+    if "1" in label.split(sep):
+        parts = label.split(sep)[:-1]
+        if len(parts) == 1:
+            year = check_year(parts[0])
+            intervals = [(year, round_to_next_5(year))]
+        elif len(parts) == 2:
+            start, end = map(check_year, parts)
+            intervals = [
+                (start, infer_last_full_year(end)),  # full years
+                (end, round_to_next_5(end)),  # partial census year
+            ]
+            # FIXME why round to five? why not directly aim for final categories? jsut to keep details? or this is treated later?
+            shares = get_vintage_shares(label, sep=sep)
+        return intervals, shares
+
+    # === Standard YYYY-YYYY case
+    try:
+        parts = label.split(sep)
+        if len(parts) == 2:
+            start, end = map(check_year, parts)
+            intervals = [(start, end)]
+        else:
+            logger.warning(f"Unexpected label format: {label}")
+    except Exception as err:
+        logger.error(f"Failed to parse label '{label}': {err}")
+
+    return intervals, shares
+
+
+if __name__ == "__main__":
+    replacements = {
+        "total": "total",
+        "movable": "mobile",
+        "apartment": "apartments",
+        "fewer": "apartment<5",
+        "more": "apartment>5",
+        "semi-": "semi_detached",
+        "duplex": "apartment_duplex",
+    }
+    census_dw = import_census_dataset(replacements=replacements)
+    display(census_dw["1991"])
+
+    pd.concat(census_dw).sort_index().to_html("./temp.html")
+
+    overwritten = overwrite_census_dataset(census_dw)
+    display(overwritten["1991"])
+
+    # TODO add checks to see that the overwrite is done properly, and that it results in totals that 'make sense' (horizontally and vertically)

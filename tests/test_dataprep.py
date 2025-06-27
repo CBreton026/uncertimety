@@ -6,6 +6,13 @@ from uncertimety.dataprep import (
     normalize_column_name,
     clean_col_names,
     import_census_dataset,
+    check_year,
+    round_to_next_5,
+    infer_last_full_year,
+    get_monthly_activity,
+    get_vintage_shares,
+    extract_year_from_token,
+    parse_single_vintage,
 )
 
 
@@ -69,8 +76,9 @@ def test_normalize_vintage_label():
         ("1945 or before", "<1945"),
         ("1946-1960", "1946-1960"),
         ("1986 or after", "1986+"),
-        ("1986 (1)", "1986"),
-        ("1996(1)", "1996"),
+        ("1986 (1)", "1986-1"),
+        ("1996(1)", "1996-1"),
+        ("1961-1971(1)", "1961-1971-1"),
         ("2011 to 2015", "2011-2015"),
     ]
     # TODO test with other sep values
@@ -88,8 +96,17 @@ def test_clean_vintage():
         "1986 or after",
         "1996(1)",
         "1981 to 1991",
+        "1961-1971(1)",
     ]
-    expected = ["total", "total", "<1945", "1986+", "1996", "1981-1991"]
+    expected = [
+        "total",
+        "total",
+        "<1945",
+        "1986+",
+        "1996-1",
+        "1981-1991",
+        "1961-1971-1",
+    ]
     assert clean_vintage(input_list) == expected
 
 
@@ -197,3 +214,112 @@ def test_bad_filename_raises(data_dir_with_bad_filename, type_replacements):
             data_dir=data_dir_with_bad_filename,
             replacements=type_replacements,
         )
+
+
+def test_check_year():
+    with pytest.raises(TypeError, match="Expected int or str convertible"):
+        check_year("nineteen")
+
+    with pytest.raises(ValueError, match="unexpected year"):
+        check_year(True)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        check_year(-9)
+
+    with pytest.raises(ValueError, match="unexpected year"):
+        # gets converted to 0
+        check_year(0.34)
+
+    with pytest.raises(ValueError, match="unexpected year"):
+        check_year("2222")
+
+
+def test_round_to_next_5():
+    cases = [
+        (1975, 1980),
+        (1976, 1980),
+        (1980, 1985),
+        (1981, 1985),
+        (1986, 1990),
+        (1988, 1990),
+    ]
+    for raw, expected in cases:
+        assert round_to_next_5(raw) == expected
+
+
+def test_infer_last_full_year():
+    cases = [
+        (1976, 1975),
+        (1981, 1980),
+        ("1986", 1985),
+        ("1999", 1995),
+    ]
+    for raw, expected in cases:
+        assert infer_last_full_year(raw) == expected
+
+
+def test_get_monthly_activity():
+    cases = [0, 11, 7, None]
+
+    for value in cases:
+        assert isinstance(get_monthly_activity(inactive_months=value), list)
+        assert len(get_monthly_activity(inactive_months=value)) == 12
+        assert all(
+            activity >= 0 for activity in get_monthly_activity(inactive_months=value)
+        )
+        assert abs(sum(get_monthly_activity(inactive_months=value)) - 1.0) < 1e-6
+
+    with pytest.raises(ValueError, match="an int between"):
+        get_monthly_activity(inactive_months=-5)
+
+    with pytest.raises(ValueError, match="an int between"):
+        get_monthly_activity(inactive_months=89)
+
+
+def test_get_vintage_shares():
+    cases = [
+        ("1960-1961-1", None, [12 / 17, 5 / 17]),
+        ("1966-1971-1", None, [60 / 65, 5 / 65]),
+        ("1960-1961-1", 4, [8 / 9, 1 / 9]),
+        ("1966-1971-1", 4, [40 / 41, 1 / 41]),
+        ("1960-1961-1", 5, [1, 0]),
+        ("1966-1971-1", 5, [1, 0]),
+    ]
+    # FIXME these tests all assume census_month = 5, test for different census_month cutoffs
+    # TODO test different separators
+
+    for label, inactive_months, expected in cases:
+        assert get_vintage_shares(
+            label, sep="-", inactive_months=inactive_months
+        ) == pytest.approx(expected)
+
+    with pytest.raises(ValueError, match="Invalid vintage label"):
+        get_vintage_shares("1986-1")
+
+
+def test_extract_year_from_token_valid():
+    assert extract_year_from_token("<1920", "<") == 1920
+    assert extract_year_from_token("1986+", "+") == 1986
+
+    with pytest.raises(ValueError):
+        extract_year_from_token("hello", "<")
+
+    with pytest.raises(ValueError):
+        extract_year_from_token("<abc", "<")
+
+
+def test_parse_single_vintage():
+    cases = [
+        ("total", 1991, [(1608, 1995)], [1.0]),
+        ("<1920", 2001, [(1608, 1920)], [1.0]),
+        ("1986+", 1996, [(1986, 2000)], [1.0]),
+        ("1960-1961-1", 1961, [(1960, 1960), (1961, 1965)], [12 / 17, 5 / 17]),
+        ("1986-1", 1986, [(1986, 1990)], [1.0]),
+        ("1966-1971-1", 1971, [(1966, 1970), (1971, 1975)], [60 / 65, 5 / 65]),
+    ]  # NOTE years are inclusive - stock is measured at the end of year (consistent with ODYM definitions)
+    # FIXME the cases might need to be changed if the behaviour of "total" is modified to stop at census year.
+
+    for label, census_year, expected_labels, expected_shares in cases:
+        new_labels, shares = parse_single_vintage(label, census_year)
+        assert new_labels == expected_labels
+        assert shares == pytest.approx(expected_shares)
