@@ -11,7 +11,7 @@ from uncertimety.dataprep import (
     infer_last_full_year,
     get_monthly_activity,
     get_vintage_shares,
-    extract_year_from_token,
+    _extract_year_from_token,
     parse_single_vintage,
 )
 
@@ -73,9 +73,9 @@ def data_dir_with_bad_filename(tmp_path, mock_csv):
 def test_normalize_vintage_label():
     cases = [
         ("Total", "total"),
-        ("1945 or before", "<1945"),
+        ("1945 or before", "le-1945"),
         ("1946-1960", "1946-1960"),
-        ("1986 or after", "1986+"),
+        ("1986 or after", "ge-1986"),
         ("1986 (1)", "1986-1"),
         ("1996(1)", "1996-1"),
         ("1961-1971(1)", "1961-1971-1"),
@@ -101,8 +101,8 @@ def test_clean_vintage():
     expected = [
         "total",
         "total",
-        "<1945",
-        "1986+",
+        "le-1945",
+        "ge-1986",
         "1996-1",
         "1981-1991",
         "1961-1971-1",
@@ -191,7 +191,7 @@ def test_import_valid_file(data_dir_with_mock_csv, type_replacements):
     assert "census_year" in df.columns
     assert "vintage" in df.columns
     assert df["census_year"].iloc[0] == "1961"
-    assert df["vintage"].iloc[2].strip() == "<1920"
+    assert df["vintage"].iloc[2].strip() == "le-1920"
     assert "apartments" in df.columns
     # TODO: add tests for dataframe content?
 
@@ -298,24 +298,27 @@ def test_get_vintage_shares():
 
 
 def test_extract_year_from_token_valid():
-    assert extract_year_from_token("<1920", "<") == 1920
-    assert extract_year_from_token("1986+", "+") == 1986
+    assert _extract_year_from_token("<1920", "<") == "le-1920"
+    assert _extract_year_from_token("1986+", "+") == "ge-1986"
 
     with pytest.raises(ValueError):
-        extract_year_from_token("hello", "<")
+        _extract_year_from_token("hello", "<")
 
     with pytest.raises(ValueError):
-        extract_year_from_token("<abc", "<")
+        _extract_year_from_token("<abc", "<")
 
 
 def test_parse_single_vintage():
     cases = [
         ("total", 1991, [(1608, 1995)], [1.0]),
+        ("le-1920", 2001, [(1608, 1920)], [1.0]),
         ("<1920", 2001, [(1608, 1920)], [1.0]),
+        ("1986+", 1986, [(1986, 1990)], [1.0]),
         ("1986+", 1996, [(1986, 2000)], [1.0]),
-        ("1960-1961-1", 1961, [(1960, 1960), (1961, 1965)], [12 / 17, 5 / 17]),
-        ("1986-1", 1986, [(1986, 1990)], [1.0]),
-        ("1966-1971-1", 1971, [(1966, 1970), (1971, 1975)], [60 / 65, 5 / 65]),
+        # FIXME: for cases in -1, should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
+        ("1960-1961-1", 1961, [(1960, 1960), (1961, 1961)], [12 / 17, 5 / 17]),
+        ("1986-1", 1986, [(1986, 1986)], [1.0]),
+        ("1966-1971-1", 1971, [(1966, 1970), (1971, 1971)], [60 / 65, 5 / 65]),
     ]  # NOTE years are inclusive - stock is measured at the end of year (consistent with ODYM definitions)
     # FIXME the cases might need to be changed if the behaviour of "total" is modified to stop at census year.
 

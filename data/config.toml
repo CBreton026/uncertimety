@@ -15,8 +15,8 @@ future_end = 2071     # Last year for the future age cohorts
     # other replacements are automatic in cleaning process
     movable = "mobile"
     apartment = "apartments"
-    fewer = "apartment<5"
-    more = "apartment>5"
+    fewer = "apartment_lt_5"  # "fewer than"
+    more = "apartment_ge_5"  # "or more"
     "semi-" = "semi_detached"
     duplex = "apartment_duplex"
 

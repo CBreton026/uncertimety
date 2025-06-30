@@ -1,8 +1,9 @@
 import re
 import toml
 import pandas as pd
+import numpy as np
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 from uncertimety.logger import init_logger
 from IPython.display import display  # FIXME only for temp test
 from datetime import datetime
@@ -59,12 +60,14 @@ def normalize_vintage_label(vintage: str, sep="-") -> str:
     replacements = {"or": "", "to": ""}
     vintage = clean_name(vintage, replacements=replacements, sep=sep)
 
+    # FIXME: it might make more sense to add the sep after "lt" or "ge" too - this could be more consistent?
+
     if "total" in vintage:
         return "total"
     elif "before" in vintage:
-        return "<" + vintage.split(sep)[0].strip()
+        return "le" + sep + vintage.split(sep)[0].strip()
     elif "after" in vintage or ">" in vintage:
-        return vintage.split(sep)[0].strip() + "+"
+        return "ge" + sep + vintage.split(sep)[0].strip()
     elif "1" in vintage.split(sep):
         # covers the case of e.g., 1986-1, 1996-1, 1986 (1), 1961-1971(1)
         # here, we keep the '1' as a sign that the last year is incomplete - it will have to be split when harmonizing the vintages
@@ -251,7 +254,8 @@ def load_and_normalize_overwrites(toml_file: str) -> dict:
         normalized_fields = {}
         for k, v in fields.items():
             # Fix type names like 'apartment_lt_5' → 'apartment<5'
-            name = k.replace("_lt_", "<").replace("_gt_", ">")
+            name = k
+            # name = k.replace("_lt_", "<").replace("_gt_", ">") FIXME: this was removed as the lt / ge writing is more explicit
             # Replace false with None
             if isinstance(v, list):
                 normalized_fields[name] = [None if i == -1 else i for i in v]
@@ -493,14 +497,28 @@ def get_vintage_shares(
     return [full_years_share / total, census_year_share / total]
 
 
-def extract_year_from_token(token: str, symbol: str) -> int:
+def _extract_year_from_token(token: str, symbol: str, sep="-") -> int:
     """
     Extracts a year from a token like '<1920' or '1986+' by splitting on symbol.
+
+    Used for error handling based on previous naming conventions.
     """
-    # TODO check if applications in other functions in dataprep.py
+    # TODO check if applications in other functions in dataprep.py - if not, delete?
     try:
         year_str = token.split(symbol)[0] if symbol == "+" else token.split(symbol)[1]
-        return check_year(int(year_str))
+
+        if not year_str.isdigit():
+            raise ValueError
+
+        if symbol == "+" or symbol == ">":
+            return "ge" + sep + year_str
+        elif symbol == "<":
+            return "le" + sep + year_str
+        else:
+            msg = f"Could not recognize symbol {symbol}"
+            logger.error(msg)
+            raise ValueError
+
     except Exception as err:
         raise ValueError(
             f"Could not extract year from '{token}' using symbol '{symbol}'"
@@ -515,8 +533,8 @@ def parse_single_vintage(
     Parses a single vintage label into [start, end] intervals and associated shares.
 
     Handles:
-    - '<1920' → (model_start, 1920)
-    - '1986+' → (1986, round_to_next_5(census_year))
+    - 'le-1920' → (model_start, 1920)
+    - 'ge-1986' → (1986, round_to_next_5(census_year))
     - '1991-1' or '1971-1981-1' → split vintage
     - 'total' → (model_start, round_to_next_5(census_year))
 
@@ -536,18 +554,60 @@ def parse_single_vintage(
         ]  # FIXME might need to be from model start to census year directly?
         return intervals, shares
 
-    if label.startswith("<"):
+    # if label.startswith("<"):
+    #     try:
+    #         year = extract_year_from_token(label, "<")
+    #         intervals = [(model_start, year)]
+    #         return intervals, shares
+    #     except ValueError as err:
+    #         logger.error(err)
+    #         return [], []
+
+    # if label.endswith("+"):
+    #     try:
+    #         year = extract_year_from_token(label, "+")
+    #         intervals = [(year, round_to_next_5(census_year))]
+    #         return intervals, shares
+    #     except ValueError as err:
+    #         logger.error(err)
+    #         return [], []
+
+    # if "le" in label.split(sep):
+    #     try:
+    #         year = label.split(sep)[:-1]  # FIXME not DRY, see cases ge / 1
+    #         intervals = [(model_start, year)]
+    #         return intervals, shares
+    #     except ValueError as err:
+    #         logger.error(err)
+    #         return [], []
+
+    # if "ge" in label.split(sep):
+    #     try:
+    #         year = label.split(sep)[:-1]  # FIXME not DRY, see cases ge / 1
+    #         intervals = [(year, round_to_next_5(census_year))]
+    #         return intervals, shares
+    #     except ValueError as err:
+    #         logger.error(err)
+    #         return [], []
+
+    try:
+        parts = label.split(sep)
+    except (ValueError, IndexError) as err:
+        logger.error(err)
+        return [], []
+
+    if "le" in parts:
         try:
-            year = extract_year_from_token(label, "<")
+            year = check_year(parts[-1])
             intervals = [(model_start, year)]
             return intervals, shares
         except ValueError as err:
             logger.error(err)
             return [], []
 
-    if label.endswith("+"):
+    if "ge" in parts:
         try:
-            year = extract_year_from_token(label, "+")
+            year = check_year(parts[-1])
             intervals = [(year, round_to_next_5(census_year))]
             return intervals, shares
         except ValueError as err:
@@ -555,16 +615,19 @@ def parse_single_vintage(
             return [], []
 
     # === Incomplete census year (e.g., 1991-1, 1971-1981-1)
-    if "1" in label.split(sep):
-        parts = label.split(sep)[:-1]
-        if len(parts) == 1:
-            year = check_year(parts[0])
-            intervals = [(year, round_to_next_5(year))]
-        elif len(parts) == 2:
-            start, end = map(check_year, parts)
+    if "1" in parts:
+        bounds = parts[:-1]
+        if len(bounds) == 1:  # i.e., only one year
+            year = check_year(bounds[0])
+            # intervals = [(year, round_to_next_5(year))]  # FIXME: should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
+            intervals = [(year, year)]
+
+        elif len(bounds) == 2:
+            start, end = map(check_year, bounds)
             intervals = [
                 (start, infer_last_full_year(end)),  # full years
-                (end, round_to_next_5(end)),  # partial census year
+                # (end, round_to_next_5(end)),  # partial census year
+                (end, end),  # FIXME see above
             ]
             # FIXME why round to five? why not directly aim for final categories? jsut to keep details? or this is treated later?
             shares = get_vintage_shares(label, sep=sep)
@@ -572,34 +635,18 @@ def parse_single_vintage(
 
     # === Standard YYYY-YYYY case
     try:
-        parts = label.split(sep)
         if len(parts) == 2:
             start, end = map(check_year, parts)
             intervals = [(start, end)]
         else:
             logger.warning(f"Unexpected label format: {label}")
+
+            # Attempt to "translate" the unmatched label
+            symbol = re.sub(r"\d", "", parts[0])  # matches and replaces all digits
+            new_label = _extract_year_from_token(parts[0], symbol)
+            return parse_single_vintage(new_label, census_year)
+
     except Exception as err:
         logger.error(f"Failed to parse label '{label}': {err}")
 
     return intervals, shares
-
-
-if __name__ == "__main__":
-    replacements = {
-        "total": "total",
-        "movable": "mobile",
-        "apartment": "apartments",
-        "fewer": "apartment<5",
-        "more": "apartment>5",
-        "semi-": "semi_detached",
-        "duplex": "apartment_duplex",
-    }
-    census_dw = import_census_dataset(replacements=replacements)
-    display(census_dw["1991"])
-
-    pd.concat(census_dw).sort_index().to_html("./temp.html")
-
-    overwritten = overwrite_census_dataset(census_dw)
-    display(overwritten["1991"])
-
-    # TODO add checks to see that the overwrite is done properly, and that it results in totals that 'make sense' (horizontally and vertically)
