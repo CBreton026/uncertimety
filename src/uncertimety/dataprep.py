@@ -3,7 +3,9 @@ import toml
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from math import isclose
+from typing import Optional, Dict, List, Tuple, Union, Iterable
+from pandas import testing as tm
 from uncertimety.logger import init_logger
 from IPython.display import display  # FIXME only for temp test
 from datetime import datetime
@@ -177,6 +179,9 @@ def import_census_dataset(
         # Clean and rename columns
         original_cols = df.columns.to_list()
         print(original_cols)  # FIXME, temp crutch
+        # FIXME - validate how other_movable is treated, as it is now
+        # aggregated with mobile, however, mobile != other_movable - this
+        # overestimates the number of mobile dwellings. however, this should have little to no impacts for the purposes of this research given the low number of mobile dwellings
         df.columns = clean_col_names(original_cols, replacements=replacements, sep="_")
         logger.debug(f"Cleaned columns for {infile.name}: {df.columns.tolist()}")
 
@@ -295,8 +300,8 @@ def patch_vintage_and_trim(df, instructions):
     if patch:
         try:
             row = int(patch["row"])
-            val = patch["value"]
-            df.at[row, "vintage"] = val
+            df.at[row, "vintage"] = patch["value"]
+            df.at[row, "census_year"] = patch["census_year"]
         except Exception as err:
             logger.warning(f"Could not patch vintage: {err}")
 
@@ -466,7 +471,10 @@ def get_vintage_shares(
         census_month (int): the month (Jan = 1, May = 5) in which the census takes place in the incomplete census year
 
     Returns:
-        list[float]: [full_years_share, census_year_share]
+        list[float]: [full_years_share, census_year_share], guaranteed to sum to 1.0
+
+    Raises:
+        ValueError: If shares do not sum to 1.0
     """
 
     monthly_activity = get_monthly_activity(inactive_months=inactive_months)
@@ -494,7 +502,65 @@ def get_vintage_shares(
     full_years_share = full_years * sum(monthly_activity)  # full years * 1
     total = full_years_share + census_year_share
 
-    return [full_years_share / total, census_year_share / total]
+    shares = [full_years_share / total, census_year_share / total]
+    if not _check_sums(shares, target=1.0):
+        msg = f"Shares do not sum to 1.0: {shares}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    return shares
+
+
+def _check_sums(
+    values: Union[Iterable[float], "np.ndarray", "pd.Series"],
+    target: float = 1.0,
+    rtol: float = 1e-9,
+    atol: float = 1e-9,
+    raise_error: bool = False,
+) -> bool:
+    """
+    Check whether numeric values sum approximately to a target value (default: 1.0).
+
+    Args:
+        values (Iterable[float] | np.ndarray | pd.Series): A list-like container of floats. If values is int or float, converts to list first.
+        target (float): Expected total sum (default: 1.0).
+        rtol (float): Relative tolerance for closeness check.
+        atol (float): Absolute tolerance for closeness check.
+        raise_error (bool): Whether to raise ValueError on failure.
+
+    Returns:
+        bool: True if values sum to target within tolerance, else False.
+
+    Raises:
+        TypeError: If input is not a recognized numeric iterable.
+        ValueError: If sum does not match target and `raise_error=True`.
+    """
+    try:
+        if isinstance(values, float) or isinstance(values, int):
+            values = [values]
+
+        values = list(values)  # Accept Series, np.ndarray, etc.
+        total = sum(values)
+    except TypeError as err:
+        logger.error("Invalid input: values must be iterable of floats", exc_info=True)
+        raise TypeError("Input must be an iterable of numbers") from err
+
+    if not all(isinstance(x, (int, float)) for x in values):
+        raise TypeError("All elements must be numeric (int or float)")
+
+    if isclose(total, target, rel_tol=rtol, abs_tol=atol):
+        return True
+
+    # If it's not close
+    logger.warning(
+        f"Sum of share(s) is {total:.12f}, target was {target:.12f} "
+        f"(rtol={rtol}, atol={atol})"
+    )  # FIXME this warning is normal/intended when single shares are tested in harmonize_vintage labels. remove?
+
+    if raise_error:
+        raise ValueError(f"Sum {total:.12f} is not close to target {target:.12f}")
+
+    return False
 
 
 def _extract_year_from_token(token: str, symbol: str, sep="-") -> int:
@@ -553,42 +619,6 @@ def parse_single_vintage(
             (model_start, round_to_next_5(census_year))
         ]  # FIXME might need to be from model start to census year directly?
         return intervals, shares
-
-    # if label.startswith("<"):
-    #     try:
-    #         year = extract_year_from_token(label, "<")
-    #         intervals = [(model_start, year)]
-    #         return intervals, shares
-    #     except ValueError as err:
-    #         logger.error(err)
-    #         return [], []
-
-    # if label.endswith("+"):
-    #     try:
-    #         year = extract_year_from_token(label, "+")
-    #         intervals = [(year, round_to_next_5(census_year))]
-    #         return intervals, shares
-    #     except ValueError as err:
-    #         logger.error(err)
-    #         return [], []
-
-    # if "le" in label.split(sep):
-    #     try:
-    #         year = label.split(sep)[:-1]  # FIXME not DRY, see cases ge / 1
-    #         intervals = [(model_start, year)]
-    #         return intervals, shares
-    #     except ValueError as err:
-    #         logger.error(err)
-    #         return [], []
-
-    # if "ge" in label.split(sep):
-    #     try:
-    #         year = label.split(sep)[:-1]  # FIXME not DRY, see cases ge / 1
-    #         intervals = [(year, round_to_next_5(census_year))]
-    #         return intervals, shares
-    #     except ValueError as err:
-    #         logger.error(err)
-    #         return [], []
 
     try:
         parts = label.split(sep)
@@ -650,3 +680,172 @@ def parse_single_vintage(
         logger.error(f"Failed to parse label '{label}': {err}")
 
     return intervals, shares
+
+
+def _validate_data_preservation(
+    original_row: pd.Series,
+    new_rows: list[dict] | list[pd.Series],
+    data_columns: list[str],
+    idx: int = None,
+    original_label: str = None,
+    atol: float = 5,
+    rtol: float = 1e-5,
+) -> list[dict]:
+    """
+    Validate that the sum of numeric values in the new rows equals the original row.
+
+    See https://pandas.pydata.org/docs/reference/api/pandas.testing.assert_series_equal.html#pandas.testing.assert_series_equal
+
+    Args:
+        original_row (pd.Series): Original row from the DataFrame.
+        new_rows (list): List of dict-like or Series-like rows after harmonization.
+        data_columns (list[str]): Columns to validate.
+        idx (int, optional): Index of the original row (for error message).
+        original_label (str, optional): Label or ID of the original row.
+        atol (float): Absolute tolerance allowed.
+        rtol (float): Relative tolerance allowed.
+
+    Returns:
+        list[dict]: Same `new_rows`, if validation passes.
+
+    Raises:
+        ValueError: If the new rows do not preserve the total values in `data_columns`.
+    """
+    try:
+        orig = original_row[data_columns].apply(pd.to_numeric, errors="coerce")
+        summed = (
+            pd.DataFrame(new_rows)[data_columns]
+            .apply(pd.to_numeric, errors="coerce")  # invalid parsing set as NaN
+            .sum(skipna=True, min_count=1)
+        )
+
+        tm.assert_series_equal(
+            orig,
+            summed,
+            check_dtype=False,
+            check_exact=False,
+            rtol=rtol,
+            atol=atol,
+            check_names=False,
+        )
+        return new_rows
+
+    except AssertionError as err:
+        msg = f"Value mismatch after splitting row {idx} (label '{original_label}'): {err}"
+        logger.warning(msg)
+        raise ValueError(msg) from err
+
+
+def harmonize_vintage_labels(
+    df: pd.DataFrame,
+    sep: str = "-",
+    model_start=1608,
+) -> pd.DataFrame:
+    """
+    Harmonizes vintage labels in the input DataFrame into specified target vintage intervals.
+
+    Args:
+        df (pd.DataFrame): Input dataframe with a 'vintage' column and numerical data columns.
+        target_vintages (List[Tuple[int, int]]): Standardized intervals to harmonize vintages into.
+        sep (str): Separator used in vintage labels.
+
+    Returns:
+        pd.DataFrame: A harmonized version of the input dataframe.
+    """
+    logger.info("Starting vintage label harmonization on %d rows", len(df))
+    data_columns = df.columns.difference(["vintage", "census_year"])
+    expanded_rows = []
+
+    # Create an expanded dataframe
+    for idx, row in df.iterrows():
+        original_label = str(row["vintage"])
+        logger.info("Parsing vintage label '%s' at index %d", original_label, idx)
+
+        parsed_intervals, shares = parse_single_vintage(
+            original_label,
+            census_year=row["census_year"],
+            sep=sep,
+            model_start=model_start,
+        )
+        new_rows = []
+
+        if not parsed_intervals or not shares:
+            msg = f"Could not parse vintage label '{original_label}' at index {idx}"
+            logger.warning(msg)  # FIXME Raise ValueError?
+            continue
+
+        # Fix the labels and shares
+        for interval, share in zip(parsed_intervals, shares):
+            start, end = interval
+            new_label = f"{start}{sep}{end}"
+            new_row = row.copy()
+            new_row["vintage"] = new_label
+            new_row["source"] = (
+                idx,
+                original_label,
+            )  # NOTE useful to check data preservation at the dataframe level
+
+            # Check if the original values were modified (shares != 1.0)
+            new_row["harmonized"] = (
+                True if not _check_sums(share, target=1.0, raise_error=False) else False
+            )
+
+            for col in data_columns:
+                val = row[col]
+                if pd.isna(val):
+                    new_row[col] = np.nan
+                else:
+                    val_out = int(round(val * share))
+                    new_row[col] = val_out
+
+            new_rows.append(new_row)
+
+        # === Consistency check: test if numeric data is preserved ===
+        try:
+            new_rows = _validate_data_preservation(
+                row,
+                new_rows,
+                data_columns=data_columns,
+                idx=idx,
+                original_label=original_label,
+            )
+            logger.info(
+                "Harmonized label '%s' → %d intervals; data validated.",
+                original_label,
+                len(new_rows),
+            )
+        except ValueError as err:
+            logger.error("Data preservation failed for row %d: %s", idx, err)
+            raise
+
+        expanded_rows.append(new_rows)
+    expanded_df = pd.DataFrame(expanded_rows)
+
+    if len(expanded_df) == len(df):
+        logger.info(
+            "Finished harmonization: kept the %d initial rows", len(expanded_df)
+        )
+    else:
+        logger.info("Finished harmonization: expanded to %d rows", len(expanded_df))
+
+    return expanded_df
+
+
+if __name__ == "__main__":
+    replacements = {
+        "total": "total",
+        "movable": "mobile",
+        "apartment": "apartments",
+        "fewer": "apartment<5",
+        "more": "apartment>5",
+        "semi-": "semi_detached",
+        "duplex": "apartment_duplex",
+    }
+    census_dw = import_census_dataset(replacements=replacements)
+
+    overwritten = overwrite_census_dataset(census_dw)
+
+    for census_year, df in census_dw.items():
+        # print(census_year, display(df.head(3)))
+        logger.info("Harmonizing census %d", int(census_year))
+        harmonize_vintage_labels(df, sep="-", model_start=1608)

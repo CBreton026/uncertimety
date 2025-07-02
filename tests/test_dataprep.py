@@ -1,4 +1,6 @@
 import pytest
+import pandas as pd
+import numpy as np
 from uncertimety.dataprep import (
     normalize_vintage_label,
     clean_vintage,
@@ -12,6 +14,8 @@ from uncertimety.dataprep import (
     get_monthly_activity,
     get_vintage_shares,
     _extract_year_from_token,
+    _check_sums,
+    _validate_data_preservation,
     parse_single_vintage,
 )
 
@@ -65,6 +69,82 @@ def data_dir_with_bad_filename(tmp_path, mock_csv):
     bad_file = census_dir / "qc_s_c_g_mock_no_year.csv"
     bad_file.write_text(mock_csv.strip(), encoding="utf-8")
     return tmp_path
+
+
+@pytest.fixture
+def data_columns():
+    return [
+        "total",
+        "single_detached",
+        "single_attached",
+        "apartments",
+        "mobile",
+    ]
+
+
+@pytest.fixture
+def original_row():
+    return pd.Series(
+        {
+            "vintage": "1960 - 1961 (1)",
+            "census_year": 1961,
+            "total": 47377,
+            "single_detached": 22911,
+            "single_attached": 2709,
+            "apartments": 21288,
+            "mobile": 469,
+        }
+    )
+
+
+@pytest.fixture
+def valid_split_rows():
+    return [
+        {
+            "vintage": "1960-1960",
+            "census_year": 1961,
+            "total": 33443,
+            "single_detached": 16172,
+            "single_attached": 1912,
+            "apartments": 15027,
+            "mobile": 331,
+        },
+        {
+            "vintage": "1961-1961",
+            "census_year": 1961,
+            "total": 13934,
+            "single_detached": 6739,
+            "single_attached": 797,
+            "apartments": 6261,
+            "mobile": 138,
+        },
+    ]
+
+
+@pytest.fixture
+def invalid_split_rows():
+    # Slightly off (Total = 47392 instead of 47377)
+    # FIXME check for different values?
+    return [
+        {
+            "vintage": "1960-1960",
+            "census_year": 1961,
+            "total": 33458,  # <-- Incremented by 15
+            "single_detached": 16172,
+            "single_attached": 1912,
+            "apartments": 15027,
+            "mobile": 331,
+        },
+        {
+            "vintage": "1961-1961",
+            "census_year": 1961,
+            "total": 13934,
+            "single_detached": 6739,
+            "single_attached": 797,
+            "apartments": 6261,
+            "mobile": 138,
+        },
+    ]
 
 
 # === Unit Tests ===
@@ -326,3 +406,44 @@ def test_parse_single_vintage():
         new_labels, shares = parse_single_vintage(label, census_year)
         assert new_labels == expected_labels
         assert shares == pytest.approx(expected_shares)
+
+
+def test_check_sums():
+    assert _check_sums([0.4, 0.6])
+    assert _check_sums(0.8, target=0.8)  # Check it accepts floats
+    assert _check_sums(0.8) is False
+
+    assert _check_sums(np.array([0.1, 0.2, 0.7]))
+    assert _check_sums(pd.Series([0.25, 0.75]))
+    assert _check_sums([0.3333, 0.6667], atol=1e-4)
+
+    with pytest.raises(TypeError):
+        _check_sums([0.1, "not a float", 0.9])
+
+    with pytest.raises(TypeError):
+        _check_sums("0.1,0.9")
+
+    with pytest.raises(ValueError):
+        _check_sums([0.1, 0.1, 0.5], raise_error=True)
+
+
+def test_valid_data_preservation(original_row, valid_split_rows, data_columns):
+    result = _validate_data_preservation(
+        original_row=original_row,
+        new_rows=valid_split_rows,
+        data_columns=data_columns,
+        idx=42,
+        original_label="1960-1961-1",
+    )
+    assert result == valid_split_rows
+
+
+def test_invalid_data_preservation(original_row, invalid_split_rows, data_columns):
+    with pytest.raises(ValueError, match="Value mismatch after splitting row"):
+        _validate_data_preservation(
+            original_row=original_row,
+            new_rows=invalid_split_rows,
+            data_columns=data_columns,
+            idx=42,
+            original_label="1960-1961-1",
+        )

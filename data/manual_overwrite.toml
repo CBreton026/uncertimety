@@ -34,7 +34,7 @@ semi_detached = [130435, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 [1981]
 # The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from B2020
 create_from = 1986
-vintage_patch = { row = 7, value = "1971-1981" }
+vintage_patch = { row = 7, value = "1971-1981", census_year = "1981"}
 drop_rows_starting_at = 11
 total = [2172855, 533290, -1, -1, -1, 518040, 480890, 640640, -1, -1, -1]
 single_detached = [954455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
@@ -46,7 +46,7 @@ apartment_duplex = [239190, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 [2001]
 # The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from B2020
 create_from = 1991
-vintage_patch = { row = 13, value = "1996-2001" }
+vintage_patch = { row = 13, value = "1996-2001", census_year = "2001"}
 total = [2978115, 450225, -1, -1, -1, 533870, 505720, -1, 610275, 247405, -1, 283175, 207945, 139495]
 single_detached = [1371005, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 semi_detached = [146455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]

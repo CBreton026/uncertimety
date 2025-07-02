@@ -21,8 +21,36 @@ future_end = 2071     # Last year for the future age cohorts
     duplex = "apartment_duplex"
 
 [dwelling_stock]
-dwelling_types = ['apartments', 'mobile', 'single_attached', 'single_detached']
-cohort_definitions = ["pre_1945", "1945_1970", "1970_1990", "post_1990"]
+target_dwelling_types = ["apartments", "mobile", "single_attached", "single_detached"]
+total_dwelling_types = [
+    "single_detached",
+    "semi_detached",
+    "row",
+    "apartment_duplex",
+    "apartment_ge_5",
+    "apartment_lt_5",
+    "other_single_attached",
+    "mobile",  # includes other_movable
+]
+target_vintages = [
+    "total",  # changes depending on census year - should it be ignored, aggregated?
+    "1608-1945",
+    "1608-1920",
+    "1921-1945",
+    "1946-1960",
+    "1961-1970",
+    "1971-1980",
+    "1981-1990",
+    "1991-1995",
+    "1996-2000",
+    "2001-2005",
+    "2006-2010",
+    "2011-2015",
+    "2016-2020",
+    "2016-2025",
+
+]
+cohort_definitions = ["pre_1945", "1945_1970", "1970_1990", "post_1990"]  # FIXME unused?
 neud_cohorts = [
     "1608-1946",
     "1946-1960",
