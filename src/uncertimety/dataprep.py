@@ -592,7 +592,12 @@ def _extract_year_from_token(token: str, symbol: str, sep="-") -> int:
 
 
 def parse_single_vintage(
-    label: str, census_year: int, sep: str = "-", model_start: int = 1608
+    label: str,
+    census_year: int,
+    sep: str = "-",
+    model_start: int = 1608,
+    parse_census_year: bool = True,
+    round_last_vintage: bool = False,
 ) -> tuple[list[tuple[int, int]], list[float]]:
     # FIXME: rename model_start? default to zero or None?
     """
@@ -613,11 +618,12 @@ def parse_single_vintage(
     intervals = []
     shares = [1.0]
 
+    # Set 'final year' of census
+    last_vintage = round_to_next_5(census_year) if round_last_vintage else census_year
+
     # === Special cases first
     if label.lower() == "total":
-        intervals = [
-            (model_start, round_to_next_5(census_year))
-        ]  # FIXME might need to be from model start to census year directly?
+        intervals = [(model_start, last_vintage)]
         return intervals, shares
 
     try:
@@ -638,7 +644,7 @@ def parse_single_vintage(
     if "ge" in parts:
         try:
             year = check_year(parts[-1])
-            intervals = [(year, round_to_next_5(census_year))]
+            intervals = [(year, last_vintage)]
             return intervals, shares
         except ValueError as err:
             logger.error(err)
@@ -650,14 +656,14 @@ def parse_single_vintage(
         if len(bounds) == 1:  # i.e., only one year
             year = check_year(bounds[0])
             # intervals = [(year, round_to_next_5(year))]  # FIXME: should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
-            intervals = [(year, year)]
+            intervals = [(year, last_vintage)]
 
         elif len(bounds) == 2:
             start, end = map(check_year, bounds)
             intervals = [
                 (start, infer_last_full_year(end)),  # full years
                 # (end, round_to_next_5(end)),  # partial census year
-                (end, end),  # FIXME see above
+                (end, last_vintage),  # FIXME see above
             ]
             # FIXME why round to five? why not directly aim for final categories? jsut to keep details? or this is treated later?
             shares = get_vintage_shares(label, sep=sep)
@@ -667,14 +673,35 @@ def parse_single_vintage(
     try:
         if len(parts) == 2:
             start, end = map(check_year, parts)
+
+            #  Case if census year falls in YYYY-YYYY range; for later censuses (2006+), there's no (1) mention to identify a partial census year
+            if parse_census_year and start <= census_year <= end:
+                # Then treat as if it was a split year
+                label_with_flag = f"{start}{sep}{end}{sep}1"
+                return parse_single_vintage(
+                    label_with_flag,
+                    census_year=census_year,
+                    sep=sep,
+                    model_start=model_start,
+                    parse_census_year=False,  # Prevents recursion
+                )
+
             intervals = [(start, end)]
+
         else:
             logger.warning(f"Unexpected label format: {label}")
 
             # Attempt to "translate" the unmatched label
             symbol = re.sub(r"\d", "", parts[0])  # matches and replaces all digits
             new_label = _extract_year_from_token(parts[0], symbol)
-            return parse_single_vintage(new_label, census_year)
+            return parse_single_vintage(
+                new_label,
+                census_year,
+                sep=sep,
+                model_start=model_start,
+                parse_census_year=parse_census_year,
+                round_last_vintage=round_last_vintage,
+            )
 
     except Exception as err:
         logger.error(f"Failed to parse label '{label}': {err}")
@@ -759,7 +786,7 @@ def harmonize_vintage_labels(
     # Create an expanded dataframe
     for idx, row in df.iterrows():
         original_label = str(row["vintage"])
-        logger.info("Parsing vintage label '%s' at index %d", original_label, idx)
+        logger.debug("Parsing vintage label '%s' at index %d", original_label, idx)
 
         parsed_intervals, shares = parse_single_vintage(
             original_label,
@@ -786,7 +813,7 @@ def harmonize_vintage_labels(
             )  # NOTE useful to check data preservation at the dataframe level
 
             # Check if the original values were modified (shares != 1.0)
-            new_row["harmonized"] = (
+            new_row["split"] = (
                 True if not _check_sums(share, target=1.0, raise_error=False) else False
             )
 
@@ -809,7 +836,7 @@ def harmonize_vintage_labels(
                 idx=idx,
                 original_label=original_label,
             )
-            logger.info(
+            logger.debug(
                 "Harmonized label '%s' → %d intervals; data validated.",
                 original_label,
                 len(new_rows),
@@ -818,8 +845,12 @@ def harmonize_vintage_labels(
             logger.error("Data preservation failed for row %d: %s", idx, err)
             raise
 
-        expanded_rows.append(new_rows)
-    expanded_df = pd.DataFrame(expanded_rows)
+        expanded_rows.extend(new_rows)
+    expanded_df = pd.DataFrame(
+        expanded_rows
+    ).reset_index(
+        drop=True
+    )  # FIXME ensure correct column order, based on 'target' (?) [df.columns.tolist() + ["source", "split"]]
 
     if len(expanded_df) == len(df):
         logger.info(
@@ -845,7 +876,15 @@ if __name__ == "__main__":
 
     overwritten = overwrite_census_dataset(census_dw)
 
+    harmonized = {}
     for census_year, df in census_dw.items():
         # print(census_year, display(df.head(3)))
         logger.info("Harmonizing census %d", int(census_year))
-        harmonize_vintage_labels(df, sep="-", model_start=1608)
+        harmonized[census_year] = harmonize_vintage_labels(
+            df, sep="-", model_start=1608
+        )
+
+    for census_year in harmonized:
+        display(harmonized[census_year])
+
+    # pd.concat(harmonized).sort_index().to_html("./temp.html")

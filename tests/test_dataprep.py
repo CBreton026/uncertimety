@@ -390,20 +390,25 @@ def test_extract_year_from_token_valid():
 
 def test_parse_single_vintage():
     cases = [
-        ("total", 1991, [(1608, 1995)], [1.0]),
-        ("le-1920", 2001, [(1608, 1920)], [1.0]),
-        ("<1920", 2001, [(1608, 1920)], [1.0]),
-        ("1986+", 1986, [(1986, 1990)], [1.0]),
-        ("1986+", 1996, [(1986, 2000)], [1.0]),
+        ("total", 1991, True, [(1608, 1995)], [1.0]),
+        ("le-1920", 2001, True, [(1608, 1920)], [1.0]),
+        ("<1920", 2001, True, [(1608, 1920)], [1.0]),
+        ("1986+", 1986, True, [(1986, 1990)], [1.0]),
+        ("1986+", 1996, True, [(1986, 2000)], [1.0]),
         # FIXME: for cases in -1, should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
-        ("1960-1961-1", 1961, [(1960, 1960), (1961, 1961)], [12 / 17, 5 / 17]),
-        ("1986-1", 1986, [(1986, 1986)], [1.0]),
-        ("1966-1971-1", 1971, [(1966, 1970), (1971, 1971)], [60 / 65, 5 / 65]),
+        ("1960-1961-1", 1961, True, [(1960, 1960), (1961, 1965)], [12 / 17, 5 / 17]),
+        ("1960-1961-1", 1961, False, [(1960, 1960), (1961, 1961)], [12 / 17, 5 / 17]),
+        ("1986-1", 1986, False, [(1986, 1986)], [1.0]),
+        ("1986-1", 1986, True, [(1986, 1990)], [1.0]),
+        ("1966-1971-1", 1971, True, [(1966, 1970), (1971, 1975)], [60 / 65, 5 / 65]),
+        ("1966-1971-1", 1971, False, [(1966, 1970), (1971, 1971)], [60 / 65, 5 / 65]),
     ]  # NOTE years are inclusive - stock is measured at the end of year (consistent with ODYM definitions)
     # FIXME the cases might need to be changed if the behaviour of "total" is modified to stop at census year.
 
-    for label, census_year, expected_labels, expected_shares in cases:
-        new_labels, shares = parse_single_vintage(label, census_year)
+    for label, census_year, round_flag, expected_labels, expected_shares in cases:
+        new_labels, shares = parse_single_vintage(
+            label, census_year, round_last_vintage=round_flag
+        )
         assert new_labels == expected_labels
         assert shares == pytest.approx(expected_shares)
 
