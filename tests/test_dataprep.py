@@ -2,22 +2,28 @@ import pytest
 import pandas as pd
 import numpy as np
 from uncertimety.dataprep import (
-    normalize_vintage_label,
-    clean_vintage,
-    clean_name,
-    normalize_column_name,
-    clean_col_names,
-    import_census_dataset,
+    _check_sums,
+    _extract_year_from_token,
+    _validate_data_preservation,
+    add_missing_vintages_types,
     check_year,
-    round_to_next_5,
-    infer_last_full_year,
+    clean_col_names,
+    clean_name,
+    clean_vintage,
+    drop_duplicate_rows,
     get_monthly_activity,
     get_vintage_shares,
-    _extract_year_from_token,
-    _check_sums,
-    _validate_data_preservation,
+    import_census_dataset,
+    infer_last_full_year,
+    normalize_column_name,
+    normalize_vintage_label,
     parse_single_vintage,
+    round_to_next_5,
+    validate_vintage_interval,
+    vintage_label_to_tuple,
 )
+# FIXME: split/rename tests (see, e.g., drop_duplicate_rows)
+# FIXME: add _ to helper functions
 
 
 @pytest.fixture
@@ -30,9 +36,8 @@ def type_replacements():
     return {
         "total": "total",
         "movable": "mobile",
-        "apartment": "apartments",
-        "fewer": "apartment<5",
-        "more": "apartment>5",
+        "fewer": "apartment_lt_5",
+        "more": "apartment_ge_5",
         "semi-": "semi_detached",
         "duplex": "apartment_duplex",
     }
@@ -147,6 +152,159 @@ def invalid_split_rows():
     ]
 
 
+@pytest.fixture
+def total_dwelling_types():
+    return [
+        "single_detached",
+        "semi_detached",
+        "row",
+        "apartment_duplex",
+        "apartment_ge_5",
+        "apartment_lt_5",
+        "other_single_attached",
+        "mobile",
+    ]
+
+
+@pytest.fixture
+def historic_vintages():
+    return [
+        "total",
+        "1608-1945",
+        "1608-1920",
+        "1921-1945",
+        "1946-1960",
+        "1961-1970",
+        "1971-1980",
+        "1981-1990",
+        "1991-1995",
+        "1996-2000",
+        "2001-2005",
+        "2006-2010",
+        "2011-2015",
+        "2016-2020",
+        "2021-2025",
+    ]
+
+
+@pytest.fixture
+def df_1991():
+    data = {
+        "census_year": [1991] * 13,
+        "vintage": [
+            "total",
+            "le-1945",
+            "le-1920",
+            "1921-1945",
+            "1946-1970",
+            "1946-1960",
+            "1961-1970",
+            "1971-1985",
+            "1971-1980",
+            "1981-1985",
+            "ge-1986",
+            "1986-1990",
+            "1991-1",
+        ],
+        "total": [
+            2634300,
+            474795,
+            204285,
+            270510,
+            994930,
+            495950,
+            498975,
+            825455,
+            600180,
+            225270,
+            339125,
+            328310,
+            10820,
+        ],
+        "single_detached": [
+            1174795,
+            184310,
+            96875,
+            87435,
+            402970,
+            196440,
+            206530,
+            430270,
+            321925,
+            108345,
+            157245,
+            152450,
+            4795,
+        ],
+        "apartment_ge_5": [
+            137120,
+            6020,
+            1680,
+            4340,
+            47635,
+            11785,
+            35855,
+            60460,
+            44755,
+            15700,
+            23005,
+            22360,
+            650,
+        ],
+        "mobile": [
+            24605,
+            180,
+            70,
+            110,
+            2505,
+            385,
+            2130,
+            19410,
+            16970,
+            2440,
+            2505,
+            2330,
+            180,
+        ],
+        "other_dwelling": [
+            1297785,
+            284285,
+            105660,
+            178620,
+            541815,
+            287345,
+            254470,
+            315320,
+            216530,
+            98785,
+            156370,
+            151170,
+            5200,
+        ],
+    }
+    return pd.DataFrame(data)
+
+
+@pytest.fixture
+def base_duplicate_df():
+    data = {
+        "vintage": ["1946-1970", "1946-1970", "1991-1995", "1991-1995"],
+        "single_detached": [np.nan, np.nan, 10, np.nan],
+        "mobile": [np.nan, np.nan, 0, np.nan],
+    }
+    return pd.DataFrame(data)
+
+
+@pytest.fixture
+def duplicate_with_conflict_df():
+    data = {
+        "vintage": ["2001-2005", "2001-2005"],
+        "single_detached": [5, 6],
+        "mobile": [1, np.nan],
+    }
+    return pd.DataFrame(data)
+
+
 # === Unit Tests ===
 
 
@@ -219,16 +377,17 @@ def test_normalize_column_name(type_replacements):
         ("Other single-attached house 3 (42)", "other_single_attached"),
         ("Single Detached", "single_detached"),
         ("Other dwelling (274)", "other_dwelling"),
-        ("  Apartment: five or more storeys", "apartment>5"),
+        ("  Apartment: five or more storeys", "apartment_ge_5"),
         ("  Apartment, detached duplex", "apartment_duplex"),
         ("Single-detached house", "single_detached"),
-        ("Apartment in a building that has five or more storeys", "apartment>5"),
+        ("Apartment in a building that has five or more storeys", "apartment_ge_5"),
         ("Other attached dwelling", "other_attached_dwelling"),
         ("  Apartment or flat in a duplex", "apartment_duplex"),
-        ("Apartment in a building that has fewer than five storeys", "apartment<5"),
+        ("Apartment in a building that has fewer than five storeys", "apartment_lt_5"),
         ("  Other single-attached house", "other_single_attached"),
         ("  Row house", "row"),
         ("  Semi-detached house", "semi_detached"),
+        ("Total structural type of dwelling", "total"),
         ("Movable dwelling", "mobile"),
     ]
 
@@ -250,7 +409,7 @@ def test_clean_col_names(type_replacements):
         "mobile",
         "apartments",
         "other_single_attached",
-        "apartment<5",
+        "apartment_lt_5",
     ]
     # TODO: test different separators?
     assert (
@@ -394,6 +553,8 @@ def test_parse_single_vintage():
         ("le-1920", 2001, True, [(1608, 1920)], [1.0]),
         ("<1920", 2001, True, [(1608, 1920)], [1.0]),
         ("1986+", 1986, True, [(1986, 1990)], [1.0]),
+        ("1986-1990", 1986, False, [(1986, 1986)], [1.0]),
+        ("1986-1990", 1986, True, [(1986, 1990)], [1.0]),
         ("1986+", 1996, True, [(1986, 2000)], [1.0]),
         # FIXME: for cases in -1, should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
         ("1960-1961-1", 1961, True, [(1960, 1960), (1961, 1965)], [12 / 17, 5 / 17]),
@@ -452,3 +613,123 @@ def test_invalid_data_preservation(original_row, invalid_split_rows, data_column
             idx=42,
             original_label="1960-1961-1",
         )
+
+
+def test_add_missing_vintages_types(
+    df_1991, historic_vintages, total_dwelling_types, tmp_path
+):
+    # Setup
+    result = add_missing_vintages_types(
+        dataframe=df_1991.copy(),
+        target_vintages=historic_vintages,
+        target_types=total_dwelling_types,
+        config_dir=tmp_path,  # ignored in this test
+        sep="-",
+    )
+    # === 1. Check all vintages are present ===
+    vintages_out = set(result["vintage"])
+    assert set(historic_vintages).issubset(vintages_out)
+
+    # === 2. Check all expected dwelling types exist as columns ===
+    for col in total_dwelling_types:
+        assert col in result.columns
+
+    # === 3. Check column order starts with census_year, vintage ===
+    assert result.columns[:2].tolist() == ["census_year", "vintage"]
+
+
+def test_missing_vintage_filling_logic(total_dwelling_types, tmp_path):
+    # Only a subset of vintages is present
+    df = pd.DataFrame(
+        {
+            "census_year": [2001],
+            "vintage": ["1946-1970"],
+            "total": [100],
+            "single_detached": [50],
+            "apartment_ge_5": [25],
+            "mobile": [25],
+        }
+    )
+
+    target_vintages = [
+        "1946-1970",
+        "2001-2005",
+        "2011-2015",
+    ]  # One before, one containing, and one after census_year
+    target_types = total_dwelling_types
+
+    result = add_missing_vintages_types(
+        dataframe=df.copy(),
+        target_vintages=target_vintages,
+        target_types=target_types,
+        config_dir=tmp_path,  # dummy path; not used
+        sep="-",
+    )
+
+    row_2011 = result[result["vintage"] == "2011-2015"].iloc[0]
+    row_2001 = result[result["vintage"] == "2001-2005"].iloc[0]
+    row_1946 = result[result["vintage"] == "1946-1970"].iloc[0]
+
+    # === Check zero fill for vintage after census year ===
+    for col in target_types:
+        assert row_2011[col] == 0 or np.isnan(row_2011[col]) is False
+        assert np.isnan(row_2001[col])
+
+    # === Check NaN preservation for original row ===
+    # Columns not originally present should be NaN in this row
+    missing_cols = set(target_types) - set(df.columns)
+    for col in missing_cols:
+        assert pd.isna(row_1946[col])
+
+
+def test_drop_duplicate_rows_only_keeps_one_nan(base_duplicate_df):
+    df = base_duplicate_df
+    meta_cols = ["vintage"]
+    data_cols = base_duplicate_df.columns.difference(meta_cols)
+
+    result = drop_duplicate_rows(df, meta_cols)
+
+    assert len(result) == 2  # one for 1946-1970, one for 1991-1995
+    assert result["vintage"].value_counts().max() == 1
+    assert result.loc[result["vintage"] == "1946-1970"].iloc[0][data_cols].isna().all()
+
+
+def test_drop_duplicate_rows_keeps_valid_row(base_duplicate_df):
+    df = base_duplicate_df
+    meta_cols = ["vintage"]
+
+    result = drop_duplicate_rows(df, meta_cols)
+
+    row = result[result["vintage"] == "1991-1995"].iloc[0]
+    assert row["single_detached"] == 10
+    assert row["mobile"] == 0
+
+
+def test_drop_duplicate_rows_raises_on_multiple_valid_rows(duplicate_with_conflict_df):
+    df = duplicate_with_conflict_df
+    meta_cols = ["vintage"]
+
+    with pytest.raises(
+        ValueError, match="Multiple non-NaN rows found for vintage '2001-2005'"
+    ):
+        drop_duplicate_rows(df, meta_cols)
+
+
+def test_validate_vintage_interval():
+    valid_tuple = (1987, 1989)
+    invalid_tuple = (1986, 1985)
+    assert validate_vintage_interval(valid_tuple) is None
+
+    with pytest.raises(ValueError, match="Invalid vintage interval:"):
+        validate_vintage_interval(invalid_tuple)
+
+
+def test_vintage_label_to_tuple():
+    # FIXME add other tests for 'wrong' inputs; see normalize_vintage_labels
+    assert vintage_label_to_tuple("1986-1990") == (1986, 1990)
+
+    with pytest.raises(ValueError):
+        vintage_label_to_tuple(1982)
+
+    with pytest.raises(ValueError):
+        vintage_label_to_tuple("19829801")

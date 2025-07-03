@@ -7,6 +7,7 @@ from math import isclose
 from typing import Optional, Dict, List, Tuple, Union, Iterable
 from pandas import testing as tm
 from uncertimety.logger import init_logger
+from uncertimety.config_loader import load_config
 from IPython.display import display  # FIXME only for temp test
 from datetime import datetime
 from dateutil import relativedelta
@@ -14,6 +15,17 @@ from dateutil import relativedelta
 logger = init_logger()
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+CONFIG = DATA_DIR / "config.toml"
+if not CONFIG.exists():
+    msg = f"No TOML file found at: {CONFIG}"
+    logger.error(msg)
+    raise FileNotFoundError(msg)
+
+try:
+    config = load_config(CONFIG)
+except (FileNotFoundError, toml.TomlDecodeError) as err:
+    logger.error("Configuration failed to load.")
+    raise err
 
 
 def clean_name(
@@ -54,7 +66,7 @@ def clean_name(
     # looks at the sep-joined words, and changes any remaining punctuation from pattern to the selected "sep"; repeated punctuation are also changed.
     clean_name = re.sub(pattern, sep, sep.join(list(filter(None, words))))
 
-    return clean_name
+    return clean_name.lower()
 
 
 def normalize_vintage_label(vintage: str, sep="-") -> str:
@@ -93,25 +105,18 @@ def normalize_column_name(col_name: str, replacements: dict, sep="_") -> str:
         sep=sep,
         remove_numbers=True,
     )
-    # col_name = col_name.split("(")[0].strip().lower()
-    # print(col_name)
 
-    if normalized in ("census_year", "vintage"):
+    # special cases
+    if normalized in ("census_year", "vintage", "total"):
         return normalized
     elif normalized == "apartment":
-        return replacements.get(normalized, "apartments")
+        return "apartments"  # <- apartment is in several cols, special case
 
-    # FIXME assumes a single key is present, and replaces based on first match
-    for key, replacement in replacements.items():
-        if key in normalized:
-            if key == "apartment":
-                # "apartment" is in several names, and breaks this function - ignore it
-                # FIXME - I could also simply remove it from the replacements dict?
-                pass
-            else:
-                return replacement
+    # other cases
+    for pattern, replacement in replacements.items():
+        if pattern in normalized:
+            return replacement
 
-    # default case, e.g., "total"
     return normalized
 
 
@@ -249,7 +254,7 @@ def load_and_normalize_overwrites(toml_file: str) -> dict:
     Loads and normalizes overwrite data from TOML.
     Replaces TOML-safe placeholders (-1) with Python None and corrects field names.
     """
-    # TODO unit tests
+    # FIXME - not DRY compared to config_loader - use it, e.g., in overwrite_census_dataset?
 
     with open(toml_file, "r") as f:
         raw = toml.load(f)
@@ -257,19 +262,15 @@ def load_and_normalize_overwrites(toml_file: str) -> dict:
     overwrites = {}
     for year, fields in raw.items():
         normalized_fields = {}
-        for k, v in fields.items():
-            # Fix type names like 'apartment_lt_5' → 'apartment<5'
-            name = k
-            # name = k.replace("_lt_", "<").replace("_gt_", ">") FIXME: this was removed as the lt / ge writing is more explicit
-            # Replace false with None
-            if isinstance(v, list):
-                normalized_fields[name] = [None if i == -1 else i for i in v]
-            elif isinstance(v, dict):
+        for name, value in fields.items():
+            if isinstance(value, list):
+                normalized_fields[name] = [None if i == -1 else i for i in value]
+            elif isinstance(value, dict):
                 normalized_fields[name] = {
-                    key: None if val == -1 else val for key, val in v.items()
+                    key: None if val == -1 else val for key, val in value.items()
                 }
             else:
-                normalized_fields[name] = None if v == -1 else v
+                normalized_fields[name] = None if value == -1 else value
         overwrites[str(year)] = normalized_fields
     return overwrites
 
@@ -591,6 +592,52 @@ def _extract_year_from_token(token: str, symbol: str, sep="-") -> int:
         ) from err
 
 
+def drop_duplicate_rows(
+    df: pd.DataFrame,
+    meta_cols: List[str] = ["census_year", "vintage", "split", "source"],
+) -> pd.DataFrame:
+    """
+    Removes duplicate vintage rows that contain only NaNs in data columns.
+    Keeps one row per vintage. Raises if multiple rows have valid data.
+
+    Args:
+        df (pd.DataFrame): Input dataframe with 'vintage' column.
+        data_cols (List[str]): Columns to check for NaN vs valid data.
+
+    Returns:
+        pd.DataFrame: Deduplicated dataframe.
+    """
+    # FIXME read meta_cols from config?
+    if "vintage" not in df.columns:
+        raise ValueError("Expected 'vintage' column in dataframe")
+
+    data_cols = df.columns.difference(meta_cols)
+    deduped_rows = []
+
+    for vintage, group in df.groupby("vintage", sort=False):
+        valid_rows = group[group[data_cols].notna().any(axis=1)]
+        nan_rows = group[~group.index.isin(valid_rows.index)]
+
+        if len(valid_rows) > 1:
+            raise ValueError(f"Multiple non-NaN rows found for vintage '{vintage}'.")
+
+        if not valid_rows.empty:
+            deduped_rows.append(valid_rows.iloc[0])
+        elif not nan_rows.empty:
+            deduped_rows.append(nan_rows.iloc[0])
+    return pd.DataFrame(deduped_rows).reset_index(drop=True)
+
+
+def validate_vintage_interval(interval: Tuple[int, int]) -> None:
+    """Ensures vintage interval is valid, i.e., end >= start."""
+    start, end = interval
+
+    if int(end) < int(start):
+        raise ValueError(
+            f"Invalid vintage interval: start={start} is greater than end={end}"
+        )
+
+
 def parse_single_vintage(
     label: str,
     census_year: int,
@@ -621,76 +668,81 @@ def parse_single_vintage(
     # Set 'final year' of census
     last_vintage = round_to_next_5(census_year) if round_last_vintage else census_year
 
-    # === Special cases first
-    if label.lower() == "total":
-        intervals = [(model_start, last_vintage)]
-        return intervals, shares
-
     try:
         parts = label.split(sep)
     except (ValueError, IndexError) as err:
-        logger.error(err)
+        logger.error(f"Failed to split label '{label}': {err}")
         return [], []
 
-    if "le" in parts:
+    # === Handle special cases first
+    if label.lower() == "total":
+        intervals = [(model_start, last_vintage)]
+
+    elif "le" in parts:
         try:
             year = check_year(parts[-1])
             intervals = [(model_start, year)]
-            return intervals, shares
+
         except ValueError as err:
             logger.error(err)
             return [], []
 
-    if "ge" in parts:
+    elif "ge" in parts:
         try:
             year = check_year(parts[-1])
             intervals = [(year, last_vintage)]
-            return intervals, shares
+
         except ValueError as err:
             logger.error(err)
             return [], []
 
     # === Incomplete census year (e.g., 1991-1, 1971-1981-1)
-    if "1" in parts:
+    elif "1" in parts:
         bounds = parts[:-1]
         if len(bounds) == 1:  # i.e., only one year
             year = check_year(bounds[0])
             # intervals = [(year, round_to_next_5(year))]  # FIXME: should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
             intervals = [(year, last_vintage)]
-
         elif len(bounds) == 2:
             start, end = map(check_year, bounds)
-            intervals = [
-                (start, infer_last_full_year(end)),  # full years
-                # (end, round_to_next_5(end)),  # partial census year
-                (end, last_vintage),  # FIXME see above
-            ]
-            # FIXME why round to five? why not directly aim for final categories? jsut to keep details? or this is treated later?
-            shares = get_vintage_shares(label, sep=sep)
-        return intervals, shares
+            if end > census_year:
+                # Manage case when splitting a census year; this prevents edge case where for census 1986, '1986-1990' was parsed (due to census year), then passed as 1986-1990-1 and split into 1986-1985 and 1990-1986
+                logger.warning(
+                    f"Bounds exceed census year: {bounds} in label '{label}' for census {census_year}"
+                )
+                intervals = [(start, last_vintage)]
+            else:
+                intervals = [
+                    (start, infer_last_full_year(end)),  # full years
+                    # (end, round_to_next_5(end)),  # partial census year
+                    (end, last_vintage),  # FIXME see above
+                ]
+
+                # Enforce strict ordering
+                # FIXME why round to five? why not directly aim for final categories? jsut to keep details? or this is treated later?
+                shares = get_vintage_shares(label, sep=sep)
 
     # === Standard YYYY-YYYY case
-    try:
-        if len(parts) == 2:
-            start, end = map(check_year, parts)
+    elif len(parts) == 2:
+        start, end = map(check_year, parts)
 
-            #  Case if census year falls in YYYY-YYYY range; for later censuses (2006+), there's no (1) mention to identify a partial census year
-            if parse_census_year and start <= census_year <= end:
-                # Then treat as if it was a split year
-                label_with_flag = f"{start}{sep}{end}{sep}1"
-                return parse_single_vintage(
-                    label_with_flag,
-                    census_year=census_year,
-                    sep=sep,
-                    model_start=model_start,
-                    parse_census_year=False,  # Prevents recursion
-                )
+        #  Case if census year falls in YYYY-YYYY range; for later censuses (2006+), there's no (1) mention to identify a partial census year
+        if parse_census_year and start <= census_year <= end:
+            # Then treat as if it was a split year
+            label_with_flag = f"{start}{sep}{end}{sep}1"
+            return parse_single_vintage(
+                label_with_flag,
+                census_year=census_year,
+                sep=sep,
+                model_start=model_start,
+                parse_census_year=False,  # Prevents recursion
+                round_last_vintage=round_last_vintage,
+            )
+        intervals = [(start, end)]
 
-            intervals = [(start, end)]
-
-        else:
-            logger.warning(f"Unexpected label format: {label}")
-
+    else:
+        logger.warning(f"Unexpected label format: {label}")
+        try:
             # Attempt to "translate" the unmatched label
             symbol = re.sub(r"\d", "", parts[0])  # matches and replaces all digits
             new_label = _extract_year_from_token(parts[0], symbol)
@@ -702,9 +754,16 @@ def parse_single_vintage(
                 parse_census_year=parse_census_year,
                 round_last_vintage=round_last_vintage,
             )
+        except Exception as err:
+            logger.error(f"Failed to parse label '{label}': {err}")
 
-    except Exception as err:
-        logger.error(f"Failed to parse label '{label}': {err}")
+    # === Validate and return
+    try:
+        for interval in intervals:
+            validate_vintage_interval(interval)
+    except ValueError as err:
+        logger.error(f"Invalid interval in label '{label}': {err}")
+        return [], []
 
     return intervals, shares
 
@@ -763,10 +822,108 @@ def _validate_data_preservation(
         raise ValueError(msg) from err
 
 
+def add_missing_vintages_types(
+    dataframe: pd.DataFrame,
+    target_vintages: Optional[List[str]] = None,
+    target_types: Optional[List[str]] = None,
+    config_dir=CONFIG,
+    sep: str = "-",
+    meta_cols=["census_year", "vintage", "source", "split"],
+) -> pd.DataFrame:
+    """
+    Ensures the dataframe contains all expected dwelling types and vintages.
+
+    - Adds missing dwelling type columns (filled with NaN)
+    - Adds missing vintage rows (filled with 0 or NaN depending on vintage position)
+
+    Args:
+        dataframe (pd.DataFrame): Input data with 'vintage', 'census_year' and dwelling type columns
+        target_vintages (List[str], optional): List of expected vintage strings (e.g., "1946-1970")
+        target_types (List[str], optional): List of expected dwelling type column names
+        data_dir (Path): Path to directory containing config.toml
+        sep (str): Separator for vintage labels (default: "-")
+
+    Returns:
+        pd.DataFrame: Updated dataframe with full set of vintages and types
+    """
+    if target_types is None:
+        try:
+            target_types = config["dwelling_stock"]["total_dwelling_types"]
+        except (NameError, KeyError) as err:
+            msg = f"Failed to access target types in config at {CONFIG}"
+            logger.error(msg)
+            raise err
+
+    if target_vintages is None:
+        try:
+            target_vintages = config["dwelling_stock"]["historic_vintages"]
+        except (NameError, KeyError) as err:
+            msg = f"Failed to access target types in config at {CONFIG}"
+            logger.error(msg)
+            raise err
+
+    unique_years = dataframe["census_year"].unique()
+    if len(unique_years) != 1:
+        msg = f"Expected a single census year, but found multiple: {unique_years.to_list()}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    census_year = int(unique_years[0])
+    type_cols = dataframe.columns.difference(["census_year", "vintage"])
+    present_vintages = set(dataframe["vintage"].astype("str"))
+    present_types = set(type_cols)
+
+    missing_types = set(target_types) - present_types
+    missing_vintages = set(target_vintages) - present_vintages
+
+    # Add missing dwelling type columns filled with NaN
+    for missing_col in missing_types:
+        logger.warning(f"Adding missing column: {missing_col}")
+        dataframe[missing_col] = np.nan
+
+    # Add missing vintages
+    new_rows = []
+    for missing_vintage in sorted(
+        missing_vintages
+    ):  # FIXME sorted(a, key=lambda student: student[1])
+        try:
+            start, end = [check_year(year) for year in missing_vintage.split(sep)]
+        except Exception as err:
+            logger.warning(
+                f"Skipping malformed vintage label '{missing_vintage}': {err}"
+            )
+            continue
+
+        if start > census_year:
+            values = {dwellings: 0 for dwellings in target_types}
+        else:
+            values = {dwellings: np.nan for dwellings in target_types}
+
+        new_row = {
+            "census_year": census_year,
+            "vintage": missing_vintage,
+            **values,
+        }
+        new_rows.append(new_row)
+
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        dataframe = pd.concat([dataframe, new_df], ignore_index=True, sort=False)
+
+    # ==== Fix column order
+    data_cols = dataframe.columns.difference(meta_cols)
+    ordered_cols = (
+        meta_cols[0:2] + data_cols.to_list() + meta_cols[2:]
+    )  # FIXME this is hardcoded - manage other 'meta' inputs without magic number?
+
+    return dataframe[[col for col in ordered_cols if col in dataframe.columns]]
+
+
 def harmonize_vintage_labels(
     df: pd.DataFrame,
     sep: str = "-",
     model_start=1608,
+    meta_cols=["census_year", "vintage", "source", "split"],
 ) -> pd.DataFrame:
     """
     Harmonizes vintage labels in the input DataFrame into specified target vintage intervals.
@@ -859,32 +1016,49 @@ def harmonize_vintage_labels(
     else:
         logger.info("Finished harmonization: expanded to %d rows", len(expanded_df))
 
-    return expanded_df
+    # ==== Consistency check : remove empty duplicate rows
+    deduped_df = drop_duplicate_rows(expanded_df)
+    removed_rows = len(expanded_df) - len(deduped_df)
+    if removed_rows > 0:
+        logger.info(f"Dropping {removed_rows} duplicated rows from the dataframe.")
+
+    return deduped_df
 
 
 if __name__ == "__main__":
-    replacements = {
-        "total": "total",
-        "movable": "mobile",
-        "apartment": "apartments",
-        "fewer": "apartment<5",
-        "more": "apartment>5",
-        "semi-": "semi_detached",
-        "duplex": "apartment_duplex",
-    }
+    replacements = config["census"]["type_map"]
+
     census_dw = import_census_dataset(replacements=replacements)
 
     overwritten = overwrite_census_dataset(census_dw)
 
     harmonized = {}
-    for census_year, df in census_dw.items():
+    for census_year, df in overwritten.items():
         # print(census_year, display(df.head(3)))
         logger.info("Harmonizing census %d", int(census_year))
         harmonized[census_year] = harmonize_vintage_labels(
             df, sep="-", model_start=1608
         )
 
-    for census_year in harmonized:
-        display(harmonized[census_year])
+    expanded = {}
+    for census_year, df in harmonized.items():
+        logger.info(
+            "Expanding census %d with missing types and vintages", int(census_year)
+        )
+        expanded[census_year] = add_missing_vintages_types(df)
+
+    for census_year in expanded:
+        display(expanded[census_year])
 
     # pd.concat(harmonized).sort_index().to_html("./temp.html")
+
+
+def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
+    """Converts 'YYYY-YYYY' vintage label into (start, end) tuple."""
+    # FIXME - add some of the previous logic from normalize_vintage_label?
+    # NOTE REPRENDRE
+    try:
+        start, end = map(int, label.strip().split(sep))
+        return (start, end)
+    except ValueError:
+        raise ValueError(f"Invalid vintage label format: {label}")

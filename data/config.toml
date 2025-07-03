@@ -13,8 +13,8 @@ future_end = 2071     # Last year for the future age cohorts
 [census]
     [census.type_map]
     # other replacements are automatic in cleaning process
+    total = "total"
     movable = "mobile"
-    apartment = "apartments"
     fewer = "apartment_lt_5"  # "fewer than"
     more = "apartment_ge_5"  # "or more"
     "semi-" = "semi_detached"
@@ -22,6 +22,7 @@ future_end = 2071     # Last year for the future age cohorts
 
 [dwelling_stock]
 target_dwelling_types = ["apartments", "mobile", "single_attached", "single_detached"]
+
 total_dwelling_types = [
     "single_detached",
     "semi_detached",
@@ -32,8 +33,9 @@ total_dwelling_types = [
     "other_single_attached",
     "mobile",  # includes other_movable
 ]
-target_vintages = [
-    "total",  # changes depending on census year - should it be ignored, aggregated?
+
+historic_vintages = [
+    "total",
     "1608-1945",
     "1608-1920",
     "1921-1945",
@@ -47,9 +49,10 @@ target_vintages = [
     "2006-2010",
     "2011-2015",
     "2016-2020",
-    "2016-2025",
+    "2021-2025",
 
 ]
+
 cohort_definitions = ["pre_1945", "1945_1970", "1970_1990", "post_1990"]  # FIXME unused?
 neud_cohorts = [
     "1608-1946",
