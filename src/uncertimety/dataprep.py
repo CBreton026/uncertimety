@@ -643,6 +643,7 @@ def parse_single_vintage(
     census_year: int,
     sep: str = "-",
     model_start: int = 1608,
+    last_census: int = 2021,
     parse_census_year: bool = True,
     round_last_vintage: bool = False,
 ) -> tuple[list[tuple[int, int]], list[float]]:
@@ -661,6 +662,9 @@ def parse_single_vintage(
     """
     label = str(label).strip()
     census_year = check_year(census_year)
+    last_census = (
+        round_to_next_5(last_census) if round_last_vintage else last_census
+    )  # FIXME add check_year()?
 
     intervals = []
     shares = [1.0]
@@ -676,7 +680,7 @@ def parse_single_vintage(
 
     # === Handle special cases first
     if label.lower() == "total":
-        intervals = [(model_start, last_vintage)]
+        intervals = [(model_start, last_census)]
 
     elif "le" in parts:
         try:
@@ -733,6 +737,7 @@ def parse_single_vintage(
             return parse_single_vintage(
                 label_with_flag,
                 census_year=census_year,
+                last_census=last_census,
                 sep=sep,
                 model_start=model_start,
                 parse_census_year=False,  # Prevents recursion
@@ -923,7 +928,9 @@ def harmonize_vintage_labels(
     df: pd.DataFrame,
     sep: str = "-",
     model_start=1608,
+    last_census=2021,
     meta_cols=["census_year", "vintage", "source", "split"],
+    round_last_vintage=True,
 ) -> pd.DataFrame:
     """
     Harmonizes vintage labels in the input DataFrame into specified target vintage intervals.
@@ -950,6 +957,7 @@ def harmonize_vintage_labels(
             census_year=row["census_year"],
             sep=sep,
             model_start=model_start,
+            round_last_vintage=round_last_vintage,
         )
         new_rows = []
 
@@ -1020,10 +1028,112 @@ def harmonize_vintage_labels(
     deduped_df = drop_duplicate_rows(expanded_df)
     removed_rows = len(expanded_df) - len(deduped_df)
     if removed_rows > 0:
-        logger.info(f"Dropping {removed_rows} duplicated rows from the dataframe.")
+        logger.info(
+            f"Dropping {removed_rows} empty duplicated rows from the dataframe."
+        )
 
     return deduped_df
 
+
+def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
+    """Converts 'YYYY-YYYY' vintage label into (start, end) tuple."""
+    # FIXME - add some of the previous logic from normalize_vintage_label?
+    # NOTE REPRENDRE
+    try:
+        start, end = map(int, str(label).strip().split(sep))
+        return (start, end)
+    except ValueError:
+        raise ValueError(f"Invalid vintage label format: {label}")
+
+def convert_df_to_int(
+    df: pd.DataFrame,
+    meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """
+    Converts all non-meta columns in the DataFrame to nullable Int32 dtype.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        meta_cols (List[str]): Columns to exclude from conversion.
+        inplace (bool): Whether to modify df in-place.
+
+    Returns:
+        pd.DataFrame: DataFrame with converted integer columns.
+    """
+    working_df = df if inplace else df.copy()
+    data_cols = [col for col in df.columns if col not in meta_cols]
+
+    # Safely convert only numeric (float/int) columns
+    for col in data_cols:
+        if pd.api.types.is_numeric_dtype(working_df[col]):
+            working_df[col] = working_df[col].astype("Int32")
+
+    return working_df
+
+
+def calculate_missing_types(
+    df: pd.DataFrame,
+    agg_types: Optional[Dict[str, List[str]]] = None,
+    config_dir=CONFIG,
+    meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """
+    Fills missing dwelling stock types by summing their component subtypes.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with dwelling type data.
+        agg_types (dict, optional): Mapping of aggregate dwelling types to lists of subtypes.
+        config_dir (path-like, optional): Path to configuration if `agg_types` is not provided.
+        meta_cols (list, optional): Columns to exclude from processing.
+        inplace (bool): Whether to modify `df` in-place. If False, returns a copy.
+
+    Returns:
+        pd.DataFrame: DataFrame with missing dwelling types imputed.
+    """
+    working_df = df if inplace else df.copy()
+    census_year = int(working_df['census_year'].unique()[0])
+    logger.debug(f"Checking for missing dwelling counts in census {census_year}")
+
+    data_cols = [col for col in working_df.columns if col not in meta_cols]
+    nan_cols = working_df[data_cols].isna().any()
+
+    if agg_types is None:
+        try:
+            agg_types = config["dwelling_stock"]["agg_types"]
+        except (ImportError, KeyError, NameError) as err:
+            msg = f"Failed to access aggregated types in config at {config_dir}"
+            logger.error(msg)
+            raise RuntimeError(msg) from err
+
+    for target_col in nan_cols[nan_cols].index:
+        subtypes = agg_types.get(target_col)
+        if not subtypes:
+            continue  # No aggregation is possible for this column
+
+        logger.info(f"Attempting to fill missing values for '{target_col}' from subtypes: {subtypes}")
+        try:
+            # Compute sum only if all subtype values are available
+            summed = working_df[subtypes].sum(axis=1, min_count=len(subtypes))
+
+            # Find where summing failed due to missing values
+            missing_rows = summed.isna()
+
+            if missing_rows.any():
+                logger.warning(
+                    f"Column '{target_col}' could not be calculated for {missing_rows.sum()} rows due to missing subtypes: {subtypes}"
+                )
+                # Only replace values where the result is valid (i.e., not NaN)
+                working_df.loc[~missing_rows, target_col] = summed[~missing_rows]
+            else:
+                working_df[target_col] = summed
+                logger.debug(f"Filled all values for '{target_col}' using subtypes: {subtypes}")
+
+        except KeyError as err:
+            logger.warning(f"Skipping '{target_col}': one or more subtypes missing from DataFrame: {err}")
+
+    return working_df
 
 if __name__ == "__main__":
     replacements = config["census"]["type_map"]
@@ -1047,18 +1157,19 @@ if __name__ == "__main__":
         )
         expanded[census_year] = add_missing_vintages_types(df)
 
-    for census_year in expanded:
-        display(expanded[census_year])
+        # make sure values are in nullable Int32
+        convert_df_to_int(expanded[census_year], inplace=True)
+
+    summed = {}
+    for census_year, df in expanded.items():
+        logger.info(
+            "Filling census %d aggregate types by summing over subtypes", int(census_year)
+        )
+        summed[census_year] = calculate_missing_types(df)
+    
+    for census_year in summed:
+        display(summed[census_year])
+    # TODO compare expanded and summed versions for given census_year, e.g., 1971?
 
     # pd.concat(harmonized).sort_index().to_html("./temp.html")
 
-
-def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
-    """Converts 'YYYY-YYYY' vintage label into (start, end) tuple."""
-    # FIXME - add some of the previous logic from normalize_vintage_label?
-    # NOTE REPRENDRE
-    try:
-        start, end = map(int, label.strip().split(sep))
-        return (start, end)
-    except ValueError:
-        raise ValueError(f"Invalid vintage label format: {label}")

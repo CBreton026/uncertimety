@@ -32,10 +32,15 @@ total_dwelling_types = [
     "apartment_lt_5",
     "other_single_attached",
     "mobile",  # includes other_movable
+    "other_dwelling",  # added for older censuses
+    "apartments",  # added for older censuses
+    "single_attached",  # added for older censuses
+    "total",  # added for older censuses
+    "other_attached_dwelling", # added for newer censuses
 ]
 
 historic_vintages = [
-    "total",
+    "1608-2025",  # total
     "1608-1945",
     "1608-1920",
     "1921-1945",
@@ -69,3 +74,10 @@ neud_cohorts = [
 
 cov = 0.2
 cv_population = 0.0012
+
+[dwelling_stock.agg_types]
+apartments = ["apartment_duplex", "apartment_ge_5", "apartment_lt_5"]
+single_attached = ["semi_detached", "other_single_attached", "row"]
+other_attached_dwelling = [ "apartment_duplex", "apartment_lt_5",
+        "other_single_attached", "row", "semi_detached",
+    ]

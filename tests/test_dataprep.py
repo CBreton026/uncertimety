@@ -21,6 +21,7 @@ from uncertimety.dataprep import (
     round_to_next_5,
     validate_vintage_interval,
     vintage_label_to_tuple,
+    calculate_missing_types,
 )
 # FIXME: split/rename tests (see, e.g., drop_duplicate_rows)
 # FIXME: add _ to helper functions
@@ -305,6 +306,27 @@ def duplicate_with_conflict_df():
     return pd.DataFrame(data)
 
 
+@pytest.fixture
+def sample_df_to_sum():
+    data = {
+        "census_year": [2021, 2021],
+        "vintage": ["2001-2005", "2006-20010"],
+        "source": ["(9, 2001-2005)", "10, 2006-2010"],
+        "split": [False, False],
+        "apartment_duplex": [3, 2],
+        "apartment_ge_5": [7, 8],
+        "apartment_lt_5": [5, 1],
+        "single_detached": [100, 10],
+        "apartments": [None, np.nan],
+    }
+    return pd.DataFrame(data)
+
+
+@pytest.fixture
+def agg_types():
+    return {"apartments": ["apartment_duplex", "apartment_ge_5", "apartment_lt_5"]}
+
+
 # === Unit Tests ===
 
 
@@ -549,7 +571,7 @@ def test_extract_year_from_token_valid():
 
 def test_parse_single_vintage():
     cases = [
-        ("total", 1991, True, [(1608, 1995)], [1.0]),
+        ("total", 1991, True, [(1608, 2025)], [1.0]),
         ("le-1920", 2001, True, [(1608, 1920)], [1.0]),
         ("<1920", 2001, True, [(1608, 1920)], [1.0]),
         ("1986+", 1986, True, [(1986, 1990)], [1.0]),
@@ -733,3 +755,19 @@ def test_vintage_label_to_tuple():
 
     with pytest.raises(ValueError):
         vintage_label_to_tuple("19829801")
+
+
+def test_calculate_missing_types_values(sample_df_to_sum, agg_types):
+    result = calculate_missing_types(sample_df_to_sum, agg_types)
+    assert result["apartments"].tolist() == [15, 11]
+
+
+def test_calculate_missing_types_preserves_original(sample_df_to_sum, agg_types):
+    # FIXME split tests in different files (e.g., one per function) then rename, preserves_original_if_not_inplace
+    _ = calculate_missing_types(sample_df_to_sum, agg_types)
+    assert sample_df_to_sum["apartments"].isna().all()
+
+
+def test_calculate_missing_types_modifies_if_inplace(sample_df_to_sum, agg_types):
+    calculate_missing_types(sample_df_to_sum, agg_types, inplace=True)
+    assert sample_df_to_sum["apartments"].tolist() == [15, 11]
