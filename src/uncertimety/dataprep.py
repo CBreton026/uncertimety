@@ -1101,7 +1101,7 @@ def calculate_missing_types(
         orig_df = df.copy()  # keep copy for data validation
 
     working_df = df if inplace else df.copy()
-    census_year = int(working_df['census_year'].unique()[0])
+    census_year = int(working_df["census_year"].unique()[0])
     logger.debug(f"Checking for missing dwelling counts in census {census_year}")
 
     data_cols = [col for col in working_df.columns if col not in meta_cols]
@@ -1120,7 +1120,9 @@ def calculate_missing_types(
         if not subtypes:
             continue  # No aggregation is possible for this column
 
-        logger.info(f"Attempting to fill missing values for '{target_col}' from subtypes: {subtypes}")
+        logger.info(
+            f"Attempting to fill missing values for '{target_col}' from subtypes: {subtypes}"
+        )
         try:
             # Compute sum only if all subtype values are available
             summed = working_df[subtypes].sum(axis=1, min_count=len(subtypes))
@@ -1136,10 +1138,14 @@ def calculate_missing_types(
                 working_df.loc[~missing_rows, target_col] = summed[~missing_rows]
             else:
                 working_df[target_col] = summed
-                logger.debug(f"Filled all values for '{target_col}' using subtypes: {subtypes}")
+                logger.debug(
+                    f"Filled all values for '{target_col}' using subtypes: {subtypes}"
+                )
 
         except KeyError as err:
-            logger.warning(f"Skipping '{target_col}': one or more subtypes missing from DataFrame: {err}")
+            logger.warning(
+                f"Skipping '{target_col}': one or more subtypes missing from DataFrame: {err}"
+            )
 
         # Validate preservation of original data
         _validate_frame_preservation(orig_df if inplace else df, working_df)
@@ -1151,11 +1157,12 @@ def _filter_numeric_subset(
     df: pd.DataFrame, vintages: list[str] = [], columns: list[str] = []
 ) -> pd.DataFrame:
     """Filter DataFrame by vintages and columns, converting to numeric."""
-    present_cols = [col for col in columns if col in df.columns]  # NOTE: this avoids a KeyError if a col in 'columns' is not present in the df.columns
+    present_cols = [
+        col for col in columns if col in df.columns
+    ]  # NOTE: this avoids a KeyError if a col in 'columns' is not present in the df.columns
 
-    return (
-        df.loc[df["vintage"].isin(vintages), present_cols]
-        .apply(pd.to_numeric, errors="coerce")
+    return df.loc[df["vintage"].isin(vintages), present_cols].apply(
+        pd.to_numeric, errors="coerce"
     )
 
 
@@ -1178,16 +1185,15 @@ def _validate_frame_preservation(
         data_rows = config["dwelling_stock"]["historic_vintages"]
 
     if data_columns is None:
-        data_columns = (
-            config["dwelling_stock"]["target_dwelling_types"]
-            + ["other_attached_dwelling", "other_dwelling",]
-        )
+        data_columns = config["dwelling_stock"]["target_dwelling_types"] + [
+            "other_attached_dwelling",
+            "other_dwelling",
+        ]
 
     orig = _filter_numeric_subset(original_df, data_rows, data_columns)
     new = _filter_numeric_subset(new_df, data_rows, data_columns)
 
     try:
-
         tm.assert_frame_equal(
             orig,
             new,
@@ -1256,7 +1262,9 @@ def filter_relevant_types_vintages(
 
     final_cols = [col for col in col_order if col in working_df.columns] + other_cols
 
-    return working_df.loc[working_df['vintage'].isin(vintages), final_cols]  # FIXME use, or replace by, filter_numeric_subset?
+    return working_df.loc[
+        working_df["vintage"].isin(vintages), final_cols
+    ]  # FIXME use, or replace by, filter_numeric_subset?
 
 
 if __name__ == "__main__":
@@ -1286,13 +1294,12 @@ if __name__ == "__main__":
         )
         expanded[census_year] = add_missing_vintages_types(harmonized[census_year])
 
-        logger.info(
-            "Converting census %d data to nullable Int32.", int(census_year)
-        )
+        logger.info("Converting census %d data to nullable Int32.", int(census_year))
         convert_df_to_int(expanded[census_year], inplace=True)
 
         logger.info(
-            "Filling census %d aggregate types by summing over subtypes", int(census_year)
+            "Filling census %d aggregate types by summing over subtypes",
+            int(census_year),
         )
         summed[census_year] = calculate_missing_types(expanded[census_year])
 
