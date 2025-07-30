@@ -21,7 +21,13 @@ future_end = 2071     # Last year for the future age cohorts
     duplex = "apartment_duplex"
 
 [dwelling_stock]
-target_dwelling_types = ["apartments", "mobile", "single_attached", "single_detached"]
+target_dwelling_types = [
+    "total",
+    "apartments",
+    "mobile",
+    "single_attached",
+    "single_detached",
+]
 
 total_dwelling_types = [
     "single_detached",

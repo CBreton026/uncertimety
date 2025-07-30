@@ -8,6 +8,7 @@ from typing import Optional, Dict, List, Tuple, Union, Iterable
 from pandas import testing as tm
 from uncertimety.logger import init_logger
 from uncertimety.config_loader import load_config
+from uncertimety.random_control import auto_seed_from_config, PY_RANDOM, NP_RANDOM
 from IPython.display import display  # FIXME only for temp test
 from datetime import datetime
 from dateutil import relativedelta
@@ -239,7 +240,7 @@ def import_census_dataset(
         # Reorder columns for clarity
         ordered_cols = ["census_year", "vintage"] + [
             col for col in df.columns if col not in ("census_year", "vintage")
-        ]
+        ]  # FIXME use meta_cols default parameter
         df = df[ordered_cols]
 
         # Save in imported dfs
@@ -781,7 +782,7 @@ def _validate_data_preservation(
     original_label: str = None,
     atol: float = 5,
     rtol: float = 1e-5,
-) -> list[dict]:
+) -> list[dict]:  # fixme rename to row preservation?
     """
     Validate that the sum of numeric values in the new rows equals the original row.
 
@@ -1045,6 +1046,7 @@ def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
     except ValueError:
         raise ValueError(f"Invalid vintage label format: {label}")
 
+
 def convert_df_to_int(
     df: pd.DataFrame,
     meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
@@ -1076,7 +1078,7 @@ def calculate_missing_types(
     df: pd.DataFrame,
     agg_types: Optional[Dict[str, List[str]]] = None,
     config_dir=CONFIG,
-    meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
+    meta_cols: List[str] = None,  # TODO - reproduce this in other meta_cols params
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1092,6 +1094,12 @@ def calculate_missing_types(
     Returns:
         pd.DataFrame: DataFrame with missing dwelling types imputed.
     """
+    if meta_cols is None:
+        meta_cols = ["census_year", "vintage", "source", "split"]
+
+    if inplace:
+        orig_df = df.copy()  # keep copy for data validation
+
     working_df = df if inplace else df.copy()
     census_year = int(working_df['census_year'].unique()[0])
     logger.debug(f"Checking for missing dwelling counts in census {census_year}")
@@ -1133,9 +1141,131 @@ def calculate_missing_types(
         except KeyError as err:
             logger.warning(f"Skipping '{target_col}': one or more subtypes missing from DataFrame: {err}")
 
+        # Validate preservation of original data
+        _validate_frame_preservation(orig_df if inplace else df, working_df)
+
     return working_df
 
+
+def _filter_numeric_subset(
+    df: pd.DataFrame, vintages: list[str] = [], columns: list[str] = []
+) -> pd.DataFrame:
+    """Filter DataFrame by vintages and columns, converting to numeric."""
+    present_cols = [col for col in columns if col in df.columns]  # NOTE: this avoids a KeyError if a col in 'columns' is not present in the df.columns
+
+    return (
+        df.loc[df["vintage"].isin(vintages), present_cols]
+        .apply(pd.to_numeric, errors="coerce")
+    )
+
+
+def _validate_frame_preservation(
+    original_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    data_rows: list[str] = [],
+    data_columns: list[str] = [],
+    atol: float = 5,
+    rtol: float = 1e-5,
+) -> list[dict]:
+    """
+    Validate that the numeric values in `new_df` are close to those in `original_df`
+    for the specified vintages and columns.
+
+    Raises:
+        ValueError: If the values differ beyond the allowed tolerance.
+    """
+    if data_rows is None:
+        data_rows = config["dwelling_stock"]["historic_vintages"]
+
+    if data_columns is None:
+        data_columns = (
+            config["dwelling_stock"]["target_dwelling_types"]
+            + ["other_attached_dwelling", "other_dwelling",]
+        )
+
+    orig = _filter_numeric_subset(original_df, data_rows, data_columns)
+    new = _filter_numeric_subset(new_df, data_rows, data_columns)
+
+    try:
+
+        tm.assert_frame_equal(
+            orig,
+            new,
+            check_dtype=True,
+            check_exact=False,
+            rtol=rtol,
+            atol=atol,
+            check_names=False,
+        )
+    except AssertionError as err:
+        msg = f"Frame mismatch, values differ from original dataframe: {err}"
+        logger.warning(msg)
+        raise ValueError(msg) from err
+
+
+def filter_relevant_types_vintages(
+    df: pd.DataFrame,
+    vintages: list[str] | None = None,
+    col_order: list[str] | None = None,
+    inplace: bool = False,
+    keep_other_cols: bool = False,
+    config_dir: Path = CONFIG,
+) -> pd.DataFrame:
+    """
+    Filter and reorder a dwelling stock DataFrame based on vintages and column order.
+
+    Parameters:
+        df: Input DataFrame.
+        vintages: List of vintages to keep (if None, load from config).
+        col_order: List of main columns to keep and reorder (others are optional).
+        inplace: Whether to operate on the DataFrame in-place.
+        keep_other_cols: Whether to keep columns not listed in col_order.
+        config_dir: Path to the config directory.
+
+    Returns:
+        A filtered and reordered DataFrame.
+    """
+    working_df = df if inplace else df.copy()
+
+    if vintages is None:
+        try:
+            vintages = config["dwelling_stock"]["historic_vintages"]
+        except (ImportError, KeyError, NameError) as err:
+            msg = f"Failed to access historic vintages in config at {config_dir}"
+            logger.error(msg)
+            raise RuntimeError(msg) from err
+
+    # Reorder columns
+    if col_order is None:
+        col_order = [
+            "census_year",
+            "vintage",
+            "total",
+            "single_detached",
+            "single_attached",
+            "apartments",
+            "mobile",
+            "other_attached_dwelling",
+            "other_dwelling",  # FIXME test to compare w/ other_attached_dwelling; replace with subset of meta_cols and target_dwelling_types from config?
+        ]
+
+    if keep_other_cols:
+        other_cols = [col for col in working_df.columns if col not in col_order]
+    else:
+        other_cols = []
+
+    final_cols = [col for col in col_order if col in working_df.columns] + other_cols
+
+    return working_df.loc[working_df['vintage'].isin(vintages), final_cols]  # FIXME use, or replace by, filter_numeric_subset?
+
+
 if __name__ == "__main__":
+    # Set program-level rng seed
+    auto_seed_from_config()
+
+    # Example usage
+    print(NP_RANDOM.normal(0, 1))
+
     replacements = config["census"]["type_map"]
 
     census_dw = import_census_dataset(replacements=replacements)
@@ -1143,33 +1273,35 @@ if __name__ == "__main__":
     overwritten = overwrite_census_dataset(census_dw)
 
     harmonized = {}
+    expanded = {}
+    summed = {}
     for census_year, df in overwritten.items():
-        # print(census_year, display(df.head(3)))
         logger.info("Harmonizing census %d", int(census_year))
         harmonized[census_year] = harmonize_vintage_labels(
             df, sep="-", model_start=1608
         )
 
-    expanded = {}
-    for census_year, df in harmonized.items():
         logger.info(
             "Expanding census %d with missing types and vintages", int(census_year)
         )
-        expanded[census_year] = add_missing_vintages_types(df)
+        expanded[census_year] = add_missing_vintages_types(harmonized[census_year])
 
-        # make sure values are in nullable Int32
+        logger.info(
+            "Converting census %d data to nullable Int32.", int(census_year)
+        )
         convert_df_to_int(expanded[census_year], inplace=True)
 
-    summed = {}
-    for census_year, df in expanded.items():
         logger.info(
             "Filling census %d aggregate types by summing over subtypes", int(census_year)
         )
-        summed[census_year] = calculate_missing_types(df)
-    
+        summed[census_year] = calculate_missing_types(expanded[census_year])
+
     for census_year in summed:
         display(summed[census_year])
-    # TODO compare expanded and summed versions for given census_year, e.g., 1971?
+    # TODO compare expanded and summed versions for given census_year, e.g., 1971, to ensure no data loss
 
-    # pd.concat(harmonized).sort_index().to_html("./temp.html")
+    # save as temporary html
+    dataset = pd.concat(summed).sort_index()
+    dataset = filter_relevant_types_vintages(dataset)
 
+    dataset.to_html("./temp.html")

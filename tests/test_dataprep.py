@@ -22,6 +22,7 @@ from uncertimety.dataprep import (
     validate_vintage_interval,
     vintage_label_to_tuple,
     calculate_missing_types,
+    _validate_frame_preservation,
 )
 # FIXME: split/rename tests (see, e.g., drop_duplicate_rows)
 # FIXME: add _ to helper functions
@@ -170,7 +171,7 @@ def total_dwelling_types():
 @pytest.fixture
 def historic_vintages():
     return [
-        "total",
+        "1608-2025",
         "1608-1945",
         "1608-1920",
         "1921-1945",
@@ -324,7 +325,52 @@ def sample_df_to_sum():
 
 @pytest.fixture
 def agg_types():
-    return {"apartments": ["apartment_duplex", "apartment_ge_5", "apartment_lt_5"]}
+    return {
+        "apartments": ["apartment_duplex", "apartment_ge_5", "apartment_lt_5"],
+        "single_attached": ["semi_detached", "other_single_attached", "row"],
+        "other_attached_dwelling": [
+            "apartment_duplex",
+            "apartment_lt_5",
+            "other_single_attached",
+            "row",
+            "semi_detached",
+        ],
+    }
+
+
+@pytest.fixture
+def original_df():
+    data = {
+        "census_year": [1981] * 3,
+        "vintage": ["1608-2025", "1946-1960", "1961-1970"],
+        "total": [2172855, None, None],
+        "apartment_duplex": [239190, None, None],
+        "apartment_ge_5": [115515, None, None],
+        "apartment_lt_5": [597995, None, None],
+        "apartments": [952700, None, None],
+        "single_attached": [228545, None, None],
+        "single_detached": [954455, None, None],
+    }
+    return pd.DataFrame(data)
+
+
+@pytest.fixture
+def matching_df(original_df):
+    return original_df.copy()
+
+
+@pytest.fixture
+def slightly_modified_df(original_df):
+    df = original_df.copy()
+    df.loc[0, "total"] += 4  # within default atol=5
+    return df
+
+
+@pytest.fixture
+def significantly_modified_df(original_df):
+    df = original_df.copy()
+    df.loc[0, "total"] += 400  # outside default atol + rtol for ~2M dwellings
+    return df
 
 
 # === Unit Tests ===
@@ -771,3 +817,34 @@ def test_calculate_missing_types_preserves_original(sample_df_to_sum, agg_types)
 def test_calculate_missing_types_modifies_if_inplace(sample_df_to_sum, agg_types):
     calculate_missing_types(sample_df_to_sum, agg_types, inplace=True)
     assert sample_df_to_sum["apartments"].tolist() == [15, 11]
+
+
+def test_validate_matching_frames(
+    matching_df, historic_vintages, data_columns, original_df
+):
+    assert (
+        _validate_frame_preservation(
+            original_df, matching_df, historic_vintages, data_columns
+        )
+        is None
+    )
+
+
+def test_validate_within_tolerance(
+    slightly_modified_df, historic_vintages, data_columns, original_df
+):
+    assert (
+        _validate_frame_preservation(
+            original_df, slightly_modified_df, historic_vintages, data_columns
+        )
+        is None
+    )
+
+
+def test_validate_outside_tolerance(
+    significantly_modified_df, historic_vintages, data_columns, original_df
+):
+    with pytest.raises(ValueError, match="Frame mismatch"):
+        _validate_frame_preservation(
+            original_df, significantly_modified_df, historic_vintages, data_columns
+        )
