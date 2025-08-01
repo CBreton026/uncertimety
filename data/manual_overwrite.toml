@@ -32,22 +32,25 @@ semi_detached = [130435, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 
 # === Files to be created manually === 
 [1981]
-# The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from B2020
+# The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from B2020. The data was later compared with values extracted manually from the census pdf files: 1981929321983engfra.pdf. While total and single_detached values are equal, there are some larger variations for apartments_ge_5 (+1965), single attached(+3440), appartments_lt_5 (-5880), apartment_duplex (-430). This allowed confirming the 'mobile' category. The pdf file also had dwelling totals for the following cohorts: "1608-1920", "1921-1945", "1946-1960", "1961-1970", "1971-1975", "1976-1979", "1980", "1981(1)", 
 create_from = 1986
-vintage_patch = { row = 7, value = "1971-1981", census_year = "1981"}
+vintage_patch = { row = 7, value = "1971-1980", census_year = "1981"}
 drop_rows_starting_at = 11
-total = [2172855, 533290, -1, -1, -1, 518040, 480890, 640640, -1, -1, -1]
-single_detached = [954455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+total = [2_172_860, 533290, 237_670, 295_620, -1, 518040, 480_890, -1, 321_565, 310_495, 8_575]
+single_detached = [954_455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 apartment_ge_5 = [115515, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 single_attached = [228545, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 apartment_lt_5 = [597995, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 apartment_duplex = [239190, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+mobile = [37_155, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+other_dwelling = [37_155, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+
 
 [2001]
-# The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from B2020
+# The cross-tabulations between type and cohort are unavailable - only the totals can be accessed from the intial B2020 file. The data was later complemented with another B2020 file: 97f0006XCB2001008, which contained dwelling totals for the following cohorts: "1608-1920", "1921-1945", "1946-1960", "1961-1970", "1971-1980", "1981-1985", "1986-1990", "1991-1995", "1996-2001". 
 create_from = 1991
 vintage_patch = { row = 13, value = "1996-2001", census_year = "2001"}
-total = [2978115, 450225, -1, -1, -1, 533870, 505720, -1, 610275, 247405, -1, 283175, 207945, 139495]
+total = [2978115, 450225, 204_125, 246_100, -1, 533870, 505720, -1, 610275, 247405, -1, 283175, 207945, 139495]
 single_detached = [1371005, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 semi_detached = [146455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 row = [80120, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]

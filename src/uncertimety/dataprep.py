@@ -1305,10 +1305,8 @@ if __name__ == "__main__":
 
     for census_year in summed:
         display(summed[census_year])
-    # TODO compare expanded and summed versions for given census_year, e.g., 1971, to ensure no data loss
 
     # save as temporary html
     dataset = pd.concat(summed).sort_index()
     dataset = filter_relevant_types_vintages(dataset)
-
     dataset.to_html("./temp.html")
