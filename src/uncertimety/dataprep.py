@@ -1,10 +1,11 @@
 import re
 import toml
+import itertools
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from math import isclose
-from typing import Optional, Dict, List, Tuple, Union, Iterable
+from typing import Optional, Dict, List, Tuple, Union, Iterable, Any
 from pandas import testing as tm
 from uncertimety.logger import init_logger
 from uncertimety.config_loader import load_config
@@ -25,8 +26,20 @@ if not CONFIG.exists():
 try:
     config = load_config(CONFIG)
 except (FileNotFoundError, toml.TomlDecodeError) as err:
-    logger.error("Configuration failed to load.")
-    raise err
+    logger.error(f"Failed to load configuration from {CONFIG}: {err}")
+    raise
+
+try:
+    META_COLS = config["dwelling_stock"]["metadata"]
+    HISTORIC_VINTAGES = config["dwelling_stock"]["historic_vintages"]
+    TARGET_TYPES = config["dwelling_stock"]["target_dwelling_types"]
+    MERGED_COLS = [
+        "other_attached_dwelling",
+        "other_dwelling",
+    ]  # fixed, not from config
+except KeyError as err:
+    logger.error(f"Missing expected key in config file {CONFIG}: {err}")
+    raise
 
 
 def clean_name(
@@ -595,7 +608,7 @@ def _extract_year_from_token(token: str, symbol: str, sep="-") -> int:
 
 def drop_duplicate_rows(
     df: pd.DataFrame,
-    meta_cols: List[str] = ["census_year", "vintage", "split", "source"],
+    meta_cols: List[str] = META_COLS,
 ) -> pd.DataFrame:
     """
     Removes duplicate vintage rows that contain only NaNs in data columns.
@@ -1078,7 +1091,7 @@ def calculate_missing_types(
     df: pd.DataFrame,
     agg_types: Optional[Dict[str, List[str]]] = None,
     config_dir=CONFIG,
-    meta_cols: List[str] = None,  # TODO - reproduce this in other meta_cols params
+    meta_cols: List[str] = META_COLS,
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1094,9 +1107,6 @@ def calculate_missing_types(
     Returns:
         pd.DataFrame: DataFrame with missing dwelling types imputed.
     """
-    if meta_cols is None:
-        meta_cols = ["census_year", "vintage", "source", "split"]
-
     if inplace:
         orig_df = df.copy()  # keep copy for data validation
 
@@ -1109,7 +1119,9 @@ def calculate_missing_types(
 
     if agg_types is None:
         try:
-            agg_types = config["dwelling_stock"]["agg_types"]
+            agg_types = config["dwelling_stock"][
+                "agg_types"
+            ]  # FIXMETODO LOAD AT TOP OF MODULE
         except (ImportError, KeyError, NameError) as err:
             msg = f"Failed to access aggregated types in config at {config_dir}"
             logger.error(msg)
@@ -1211,11 +1223,13 @@ def _validate_frame_preservation(
 
 def filter_relevant_types_vintages(
     df: pd.DataFrame,
-    vintages: list[str] | None = None,
+    vintages: list[str] = HISTORIC_VINTAGES,
+    target_types: list[str] = TARGET_TYPES,
+    merged_cols: list[str] = MERGED_COLS,
     col_order: list[str] | None = None,
     inplace: bool = False,
     keep_other_cols: bool = False,
-    config_dir: Path = CONFIG,
+    meta_cols: list[str] = META_COLS,
 ) -> pd.DataFrame:
     """
     Filter and reorder a dwelling stock DataFrame based on vintages and column order.
@@ -1223,9 +1237,10 @@ def filter_relevant_types_vintages(
     Parameters:
         df: Input DataFrame.
         vintages: List of vintages to keep (if None, load from config).
-        col_order: List of main columns to keep and reorder (others are optional).
+        col_order: List of main columns to keep and reorder (others are optional). The meta_cols are automatically added.
         inplace: Whether to operate on the DataFrame in-place.
-        keep_other_cols: Whether to keep columns not listed in col_order.
+        keep_other_cols: Whether to keep columns not listed in col_order and meta_cols
+        meta_cols: list of additional columns to keep
         config_dir: Path to the config directory.
 
     Returns:
@@ -1233,38 +1248,119 @@ def filter_relevant_types_vintages(
     """
     working_df = df if inplace else df.copy()
 
-    if vintages is None:
-        try:
-            vintages = config["dwelling_stock"]["historic_vintages"]
-        except (ImportError, KeyError, NameError) as err:
-            msg = f"Failed to access historic vintages in config at {config_dir}"
-            logger.error(msg)
-            raise RuntimeError(msg) from err
-
     # Reorder columns
     if col_order is None:
-        col_order = [
-            "census_year",
-            "vintage",
-            "total",
-            "single_detached",
-            "single_attached",
-            "apartments",
-            "mobile",
-            "other_attached_dwelling",
-            "other_dwelling",  # FIXME test to compare w/ other_attached_dwelling; replace with subset of meta_cols and target_dwelling_types from config?
-        ]
+        col_order = merge_unique_ordered([meta_cols, target_types, merged_cols])
+    else:
+        col_order = merge_unique_ordered([meta_cols, col_order])
 
     if keep_other_cols:
         other_cols = [col for col in working_df.columns if col not in col_order]
     else:
         other_cols = []
 
-    final_cols = [col for col in col_order if col in working_df.columns] + other_cols
+    final_cols = (
+        [col for col in col_order if col in working_df.columns] + other_cols
+    )  # FIXME not DRY, have separate function to filter cols? see standardize_census()
 
     return working_df.loc[
         working_df["vintage"].isin(vintages), final_cols
     ]  # FIXME use, or replace by, filter_numeric_subset?
+
+
+def standardize_census(
+    df: pd.DataFrame,
+    inplace: bool = False,
+    vintages: list[str] = HISTORIC_VINTAGES,
+    target_types: list[str] = TARGET_TYPES,
+    meta_cols: list[str] = META_COLS[:2],
+    merged_cols: list[str] = MERGED_COLS,
+    col_order: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Merge 'other_attached_dwelling' and 'other_dwelling' intelligently,
+    keeping the one with fewer NaNs, and standardize the result to 'other_dwelling'.
+    Filters and reorders columns accordingly.
+    """
+    working_df = df if inplace else df.copy()
+
+    # Reorder columns
+    if col_order is None:
+        col_order = merge_unique_ordered([meta_cols, target_types, ["other_dwelling"]])
+    else:
+        col_order = merge_unique_ordered(
+            *[meta_cols, col_order, ["other_dwelling"]]
+        )  # FIXME hardcoded; also, needs to be a set, otherwise it gets duplicated with successive passes
+
+    # Standardize the 'other_dwelling' and 'other_attached_dwelling' types
+    try:
+        nan_count = working_df.loc[:, merged_cols].isna().sum()
+        if nan_count["other_attached_dwelling"] < nan_count["other_dwelling"]:
+            keep_col = "other_attached_dwelling"
+        else:
+            keep_col = "other_dwelling"
+
+        if keep_col != "other_dwelling":
+            working_df["other_dwelling"] = working_df[keep_col]
+            working_df = working_df.drop(columns=[keep_col])
+    except KeyError as err:
+        msg = f"Could not find one or more {merged_cols} in DataFrame: {err}"
+        logger.error(msg)
+        raise
+
+    return filter_relevant_types_vintages(
+        working_df,
+        vintages=vintages,
+        col_order=col_order,
+        meta_cols=meta_cols,
+        keep_other_cols=False,
+    )
+
+
+def merge_unique_ordered(*lists: List[Any]) -> List[Any]:
+    """
+    Return an ordered list of unique items from the input lists.
+
+    Handles both standard usage (a, b, c) and common mistake ([a, b, c]).
+
+    Args:
+        *lists (List[Any]): Any number of lists to merge.
+
+    Returns:
+        List[Any]: A flattened, ordered list of unique items.
+    """
+    # Handle common mistake: merge_unique_ordered([a, b, c]) instead of merge_unique_ordered(a, b, c)
+    if (
+        len(lists) == 1
+        and isinstance(lists[0], list)
+        and all(isinstance(sub, list) for sub in lists[0])
+    ):
+        lists = tuple(lists[0])  # unpack the inner list
+
+    flat = itertools.chain.from_iterable(lists)
+    return list(dict.fromkeys(flat))
+
+
+def validate_dwelling_counts(
+        df: pd.DataFrame,
+        inplace: bool = False,
+    ):
+
+    working_df = df if inplace else df.copy()
+
+    # TODO reprendre ici; voir ce que j'avais déjà codé précédemment si parties réutilisables.
+
+    # if columns outside target cols or if vintages outside target vintages, then filter_relevant
+
+    # accept a dataframe, filter relevant types and vintages, including other_dwelling
+    # check sums over types; check if the 'total' agrees with the sums, using atol of ~5 (20?) and rtol 1e-5.
+    # check sums over cohorts (0-2025) vs rest
+
+    # check marginals : compare 'total' and '0-2025'
+    # logger.warn any problems
+
+    # IF there are issues, then launch IPFN procedure (?)
+    return working_df
 
 
 if __name__ == "__main__":
@@ -1280,9 +1376,12 @@ if __name__ == "__main__":
 
     overwritten = overwrite_census_dataset(census_dw)
 
-    harmonized = {}
-    expanded = {}
-    summed = {}
+    # TODO check for memory issues here. not super efficient to have four copies of dataframe
+    harmonized = {}  # TODO rename to something more meaningful
+    expanded = {}  # TODO rename to something more meaningful
+    summed = {}  # TODO rename to something more meaningful
+    standardized = {}
+
     for census_year, df in overwritten.items():
         logger.info("Harmonizing census %d", int(census_year))
         harmonized[census_year] = harmonize_vintage_labels(
@@ -1303,10 +1402,19 @@ if __name__ == "__main__":
         )
         summed[census_year] = calculate_missing_types(expanded[census_year])
 
-    for census_year in summed:
-        display(summed[census_year])
+        logger.info(
+            "Extracting relevant subset for census %d",
+            int(census_year),
+        )
+        standardized[census_year] = standardize_census(summed[census_year])
+        # TODO IPFN
+
+    for census_year in standardized:
+        display(standardized[census_year])
 
     # save as temporary html
-    dataset = pd.concat(summed).sort_index()
-    dataset = filter_relevant_types_vintages(dataset)
+    dataset = pd.concat(standardized).sort_index()
+    dataset = filter_relevant_types_vintages(
+        dataset, meta_cols=["census_year", "vintage"]
+    )
     dataset.to_html("./temp.html")

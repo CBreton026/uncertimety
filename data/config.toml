@@ -29,6 +29,13 @@ target_dwelling_types = [
     "single_detached",
 ]
 
+metadata = [
+    "census_year",
+    "vintage",
+    "source",
+    "split",
+]
+
 total_dwelling_types = [
     "single_detached",
     "semi_detached",
@@ -47,7 +54,7 @@ total_dwelling_types = [
 
 historic_vintages = [
     "1608-2025",  # total
-    "1608-1945",
+    # "1608-1945", # Removed, as it's the only duplicated vintage
     "1608-1920",
     "1921-1945",
     "1946-1960",
