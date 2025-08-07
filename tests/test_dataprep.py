@@ -23,6 +23,7 @@ from uncertimety.dataprep import (
     vintage_label_to_tuple,
     calculate_missing_types,
     _validate_frame_preservation,
+    check_series_sum,
 )
 # FIXME: split/rename tests (see, e.g., drop_duplicate_rows)
 # FIXME: add _ to helper functions
@@ -370,6 +371,20 @@ def slightly_modified_df(original_df):
 def significantly_modified_df(original_df):
     df = original_df.copy()
     df.loc[0, "total"] += 400  # outside default atol + rtol for ~2M dwellings
+    return df
+
+
+@pytest.fixture
+def df_for_check_sums():
+    df = pd.DataFrame(
+        {
+            "vintage": ["1608-2025", "1608-1920", "1921-1945", "1946-1960"],
+            "total": [1500, 500, 200, 800],
+            "single_detached": [500, 300, 192, 8],
+            "other_attached_dwelling": [800, np.nan, 8, 792],
+            "other_dwelling": [200, np.nan, np.nan, 0],
+        }
+    )
     return df
 
 
@@ -848,3 +863,50 @@ def test_validate_outside_tolerance(
         _validate_frame_preservation(
             original_df, significantly_modified_df, historic_vintages, data_columns
         )
+
+
+class TestCheckSeriesSum:  # FIXME rename _check_sums?
+    def test_exact_match(self, df_for_check_sums):
+        """Test when component values sum exactly to total."""
+        passed, details = check_series_sum(df_for_check_sums, "1608-2025")
+        assert passed
+        assert details["total"] == 1500
+        assert details["component_sum"] == 1500
+        assert details["difference"] == 0
+
+    def test_within_tolerance(self, df_for_check_sums):
+        """Test when sum is within tolerance."""
+        df = df_for_check_sums.copy()
+        df.loc[1, "total"] = 502  # +2
+        df.loc[2, "total"] = 203  # +3
+
+        passed, details = check_series_sum(df, "total", atol=6, rtol=0, axis=1)
+        assert passed
+        assert details["difference"] == -5
+
+        # Test with relative tolerance
+        df.loc[1, "total"] = 490  # -10
+        df.loc[2, "total"] = 203  # +3
+
+        passed, details = check_series_sum(df, "total", atol=0, rtol=0.01, axis=1)
+        assert passed
+        assert details["difference"] == 7
+
+    def test_outside_tolerance(self, df_for_check_sums):
+        """Test when sum is outside tolerance."""
+        df = df_for_check_sums.copy()
+        df.loc[1, "total"] = 510
+
+        passed, details = check_series_sum(df, "total", atol=5, rtol=1e-5, axis=1)
+        assert not passed
+        assert details["difference"] == -10
+
+    def test_wrong_target_axis(self, df_for_check_sums):
+        """Test when target axis is not 0 or 1."""
+        with pytest.raises(KeyError, match="not found in DataFrame"):
+            check_series_sum(df_for_check_sums, "total", axis=0)
+
+    def test_invalid_axis(self, df_for_check_sums):
+        """Test when target axis is not 0 or 1."""
+        with pytest.raises(ValueError, match="Invalid axis"):
+            check_series_sum(df_for_check_sums, "total", axis=3)

@@ -1398,6 +1398,155 @@ def validate_dwelling_counts(
     # IF there are issues, then launch IPFN procedure (?)
     return working_df
 
+def check_series_sum(
+    df: pd.DataFrame,
+    target: str,  # either a row or column label
+    group_by: str = 'vintage',
+    total_label: str = None,
+    atol: float = 5,
+    rtol: float = 1e-5,
+    axis: bool = 0,
+) -> Tuple[bool, pd.Series]:
+    """
+    Check if components sum to total within grouped data.
+    
+    Args:
+        df: DataFrame with data to check
+        value_col: Column containing values to sum (e.g., 'total')
+        group_by: Column to group by (e.g., 'vintage')
+        vintage_total: Label in group_by representing the total
+        atol: Absolute tolerance for comparison (used by np.isclose)
+        rtol: Relative tolerance for comparison (used by np.isclose)
+        
+    Returns:
+        Tuple of (bool, Series) where:
+            - bool indicates if all groups pass the check
+            - Series contains the difference between total and sum of components for each group
+    """
+    if total_label is None:
+        total_label = 'total' if axis == 0 else '1608-2025'  # FIXME use constants?
+
+    grouped = df.groupby(group_by).sum()
+
+    if axis == 0:  # for rows, sum over types
+        try:
+            total = grouped.loc[target, total_label]
+            components = grouped.loc[target].drop(total_label)
+        except KeyError as err:
+            raise KeyError(f"Target '{target}' not found in DataFrame {grouped.index}: {err}. Check that target and axis are consistent.")
+    elif axis == 1:  # for columns, sum over vintages
+        try:
+            total = grouped.loc[total_label, target]
+            components = grouped[target].drop(total_label)
+        except KeyError as err:
+            raise KeyError(f"Target '{target}' not found in DataFrame {grouped.columns}: {err}")
+    else:
+        raise ValueError(f"Invalid axis {axis}. Use 0 for rows or 1 for columns.")
+
+    # Sum the components
+    component_sum = components.fillna(0).sum()
+    
+    # Calculate difference
+    difference = total - component_sum
+    
+    # Check if within tolerance (using numpy's isclose for both absolute and relative tolerance)
+    check_passed = np.isclose(total, component_sum, rtol=rtol, atol=atol)
+    
+    result = pd.Series({
+        'target': target,
+        'total_label': total_label,
+        'total': total,
+        'component_sum': component_sum,
+        'difference': difference,
+        'check_passed': check_passed
+    })
+    
+    return check_passed, result
+
+
+# TODO Reprendre check_marginals
+def check_marginals(
+    df: pd.DataFrame, 
+    vintage: str = "1608-2025", 
+    dwelling_type: str = "total",
+    atol: float = 5,
+    rtol: float = 1e-5
+) -> bool:
+    """
+    Check if the marginals (total counts) are consistent across vintages and types.
+    
+    Args:
+        df: DataFrame with vintage and dwelling type data
+        vintage: The vintage label representing the total (e.g., "1608-2025")
+        dwelling_type: The column name representing total dwellings (e.g., "total")
+        atol: Absolute tolerance for comparison
+        rtol: Relative tolerance for comparison
+        
+    Returns:
+        bool: True if the marginals are consistent, else False
+    """
+    # Check that required columns exist
+    if 'vintage' not in df.columns:
+        logger.error("DataFrame does not contain 'vintage' column.")
+        raise ValueError("DataFrame does not contain 'vintage' column.")
+
+    if dwelling_type not in df.columns:
+        logger.error(f"{dwelling_type} column not found in DataFrame.")
+        raise ValueError(f"{dwelling_type} column not found in DataFrame.")
+
+    # Find appropriate vintage if specified one isn't available
+    if vintage not in df["vintage"].values:
+        logger.warning(f"Vintage '{vintage}' not found in DataFrame. Using vintage of max '{dwelling_type}' value instead.")
+        vintage = df.loc[df[dwelling_type].idxmax(), 'vintage']
+
+    try:
+        # Check if dwelling type values sum to the total vintage value
+        dwelling_passed, dwelling_details = check_series_sum(
+            df=df, 
+            group_col='vintage',
+            value_col=dwelling_type,
+            total_label=vintage,
+            atol=atol,
+            rtol=rtol
+        )
+        
+        # Check if vintage values sum to the total dwelling type value
+        # Get the row for the specified vintage
+        vintage_row = df.loc[df['vintage'] == vintage].iloc[0]
+        vintage_df = pd.DataFrame(vintage_row).T.reset_index(drop=True)
+        
+        vintage_passed, vintage_details = check_sums(
+            df=vintage_df,
+            group_col='vintage',  # This is just a placeholder since we're working with a single row
+            value_col=dwelling_type,
+            total_label=vintage,  # This ensures we get the right row
+            atol=atol,
+            rtol=rtol
+        )
+        
+        if not dwelling_passed or not vintage_passed:
+            logger.warning(
+                f"Marginal check failed: dwelling series check_passed={dwelling_passed} "
+                f"or vintage series check_passed={vintage_passed}"
+            )
+            return False
+        
+        # Additionally check if the totals from both approaches are consistent
+        dwelling_total = dwelling_details['total_value']
+        vintage_total = vintage_details['total_value']
+        
+        if not np.isclose(dwelling_total, vintage_total, atol=atol, rtol=rtol):
+            logger.warning(
+                f"Marginal check failed: dwelling total {dwelling_total} vs vintage total {vintage_total} "
+                f"for {dwelling_type} in vintage {vintage}"
+            )
+            return False
+            
+    except KeyError as err:
+        logger.error(f"Error checking marginals: {err}")
+        return False
+        
+    return True
 
 def process_census_dataframe(df, census_year):
     """Process a single census dataframe through the full pipeline."""
@@ -1451,3 +1600,4 @@ if __name__ == "__main__":
         dataset, meta_cols=["census_year", "vintage"]
     )
     dataset.to_html("./temp.html")
+
