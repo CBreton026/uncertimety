@@ -391,478 +391,531 @@ def df_for_check_sums():
 # === Unit Tests ===
 
 
-def test_normalize_vintage_label():
-    cases = [
-        ("Total", "total"),
-        ("1945 or before", "le-1945"),
-        ("1946-1960", "1946-1960"),
-        ("1986 or after", "ge-1986"),
-        ("1986 (1)", "1986-1"),
-        ("1996(1)", "1996-1"),
-        ("1961-1971(1)", "1961-1971-1"),
-        ("2011 to 2015", "2011-2015"),
-    ]
-    # TODO test with other sep values
-    # TODO: check for 1960 - 1961 (1) : how is it treated?
-    for raw, expected in cases:
-        assert normalize_vintage_label(raw) == expected
-
-
-def test_clean_vintage():
-    # TODO test with other sep values
-    input_list = [
-        "Total",
-        "Total occupied private dwellings",
-        "1945 or before",
-        "1986 or after",
-        "1996(1)",
-        "1981 to 1991",
-        "1961-1971(1)",
-    ]
-    expected = [
-        "total",
-        "total",
-        "le-1945",
-        "ge-1986",
-        "1996-1",
-        "1981-1991",
-        "1961-1971-1",
-    ]
-    assert clean_vintage(input_list) == expected
-
-
-def test_clean_name(vintage_replacements):
-    cases = [
-        ("Total", "total"),
-        (" !-:_ _Total --- _ ", "total"),
-        ("1956-1961", "1956_1961"),
-        ("1945-or-before", "1945_before"),
-        ("  1945  or  before   ", "1945_before"),
-        ("  1945  to  1961   ", "1945_1961"),
-        ("1996(1)", "1996_1"),
-        ("1986 or after", "1986_after"),
-        ("   1986  (1)  ", "1986_1"),
-        ("2011 to 2015", "2011_2015"),
+class TestNormalizeVintageLabel:
+    def test_expected_label(self):
+        cases = [
+            ("Total", "total"),
+            ("1945 or before", "le-1945"),
+            ("1946-1960", "1946-1960"),
+            ("1986 or after", "ge-1986"),
+            ("1986 (1)", "1986-1"),
+            ("1996(1)", "1996-1"),
+            ("1961-1971(1)", "1961-1971-1"),
+            ("2011 to 2015", "2011-2015"),
+        ]
+        # TODO test with other sep values
         # TODO: check for 1960 - 1961 (1) : how is it treated?
-    ]
-
-    for raw, expected in cases:
-        # TODO Test using different separators?
-        assert clean_name(raw, replacements=vintage_replacements) == expected
+        for raw, expected in cases:
+            assert normalize_vintage_label(raw) == expected
 
 
-def test_normalize_column_name(type_replacements):
-    cases = [
-        ("Total", "total"),
-        ("Apartment", "apartments"),
-        ("Single attached", "single_attached"),
-        ("Other single-attached house", "other_single_attached"),
-        ("Other single-attached house 3 (42)", "other_single_attached"),
-        ("Single Detached", "single_detached"),
-        ("Other dwelling (274)", "other_dwelling"),
-        ("  Apartment: five or more storeys", "apartment_ge_5"),
-        ("  Apartment, detached duplex", "apartment_duplex"),
-        ("Single-detached house", "single_detached"),
-        ("Apartment in a building that has five or more storeys", "apartment_ge_5"),
-        ("Other attached dwelling", "other_attached_dwelling"),
-        ("  Apartment or flat in a duplex", "apartment_duplex"),
-        ("Apartment in a building that has fewer than five storeys", "apartment_lt_5"),
-        ("  Other single-attached house", "other_single_attached"),
-        ("  Row house", "row"),
-        ("  Semi-detached house", "semi_detached"),
-        ("Total structural type of dwelling", "total"),
-        ("Movable dwelling", "mobile"),
-    ]
-
-    for raw, expected in cases:
-        assert normalize_column_name(raw, type_replacements) == expected
+class TestCleanVintage:
+    def test_expected_vintage(self):
+        # TODO test with other sep values
+        input_list = [
+            "Total",
+            "Total occupied private dwellings",
+            "1945 or before",
+            "1986 or after",
+            "1996(1)",
+            "1981 to 1991",
+            "1961-1971(1)",
+        ]
+        expected = [
+            "total",
+            "total",
+            "le-1945",
+            "ge-1986",
+            "1996-1",
+            "1981-1991",
+            "1961-1971-1",
+        ]
+        assert clean_vintage(input_list) == expected
 
 
-def test_clean_col_names(type_replacements):
-    # TODO: move some names from test_normalize_column_names here
-    input_cols = [
-        "Total",
-        "Movable house",
-        "Apartment",
-        "  Other single-attached house",
-        "  Apartment in a building that has fewer than five storeys (76)",
-    ]
-    expected = [
-        "total",
-        "mobile",
-        "apartments",
-        "other_single_attached",
-        "apartment_lt_5",
-    ]
-    # TODO: test different separators?
-    assert (
-        clean_col_names(input_cols, replacements=type_replacements, sep="_") == expected
-    )
+class TestCleanName:
+    def test_expected_vintage_label(self, vintage_replacements):
+        cases = [
+            ("Total", "total"),
+            (" !-:_ _Total --- _ ", "total"),
+            ("1956-1961", "1956_1961"),
+            ("1945-or-before", "1945_before"),
+            ("  1945  or  before   ", "1945_before"),
+            ("  1945  to  1961   ", "1945_1961"),
+            ("1996(1)", "1996_1"),
+            ("1986 or after", "1986_after"),
+            ("   1986  (1)  ", "1986_1"),
+            ("2011 to 2015", "2011_2015"),
+            # TODO: check for 1960 - 1961 (1) : how is it treated?
+        ]
+
+        for raw, expected in cases:
+            # TODO Test using different separators?
+            assert clean_name(raw, replacements=vintage_replacements) == expected
 
 
-def test_import_valid_file(data_dir_with_mock_csv, type_replacements):
-    result = import_census_dataset(
-        data_dir=data_dir_with_mock_csv, replacements=type_replacements
-    )
-    # FIXME unit="dw" seems useless?
+class TestNormalizeColumnName:
+    def test_expected_type_label(self, type_replacements):
+        cases = [
+            ("Total", "total"),
+            ("Apartment", "apartments"),
+            ("Single attached", "single_attached"),
+            ("Other single-attached house", "other_single_attached"),
+            ("Other single-attached house 3 (42)", "other_single_attached"),
+            ("Single Detached", "single_detached"),
+            ("Other dwelling (274)", "other_dwelling"),
+            ("  Apartment: five or more storeys", "apartment_ge_5"),
+            ("  Apartment, detached duplex", "apartment_duplex"),
+            ("Single-detached house", "single_detached"),
+            ("Apartment in a building that has five or more storeys", "apartment_ge_5"),
+            ("Other attached dwelling", "other_attached_dwelling"),
+            ("  Apartment or flat in a duplex", "apartment_duplex"),
+            (
+                "Apartment in a building that has fewer than five storeys",
+                "apartment_lt_5",
+            ),
+            ("  Other single-attached house", "other_single_attached"),
+            ("  Row house", "row"),
+            ("  Semi-detached house", "semi_detached"),
+            ("Total structural type of dwelling", "total"),
+            ("Movable dwelling", "mobile"),
+        ]
 
-    assert isinstance(result, dict)
-    assert "1961" in result
-    df = result["1961"]
-
-    assert "census_year" in df.columns
-    assert "vintage" in df.columns
-    assert df["census_year"].iloc[0] == "1961"
-    assert df["vintage"].iloc[2].strip() == "le-1920"
-    assert "apartments" in df.columns
-    # TODO: add tests for dataframe content?
+        for raw, expected in cases:
+            assert normalize_column_name(raw, type_replacements) == expected
 
 
-def test_missing_replacements_raises(data_dir_with_mock_csv):
-    with pytest.raises(ValueError, match="replacements"):
-        import_census_dataset(data_dir=data_dir_with_mock_csv, replacements=None)
-
-
-def test_no_files_found_raises(tmp_path, type_replacements):
-    empty_dir = tmp_path / "census"
-    empty_dir.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(ValueError, match="No census CSV files"):
-        import_census_dataset(data_dir=tmp_path, replacements=type_replacements)
-
-
-def test_bad_filename_raises(data_dir_with_bad_filename, type_replacements):
-    with pytest.raises(ValueError, match="valid 4-digit census year"):
-        import_census_dataset(
-            data_dir=data_dir_with_bad_filename,
-            replacements=type_replacements,
+class TestCleanColNames:
+    def test_clean_col_names(self, type_replacements):
+        # TODO: move some names from test_normalize_column_names here
+        input_cols = [
+            "Total",
+            "Movable house",
+            "Apartment",
+            "  Other single-attached house",
+            "  Apartment in a building that has fewer than five storeys (76)",
+        ]
+        expected = [
+            "total",
+            "mobile",
+            "apartments",
+            "other_single_attached",
+            "apartment_lt_5",
+        ]
+        # TODO: test different separators?
+        assert (
+            clean_col_names(input_cols, replacements=type_replacements, sep="_")
+            == expected
         )
 
 
-def test_check_year():
-    with pytest.raises(TypeError, match="Expected int or str convertible"):
-        check_year("nineteen")
-
-    with pytest.raises(ValueError, match="unexpected year"):
-        check_year(True)
-
-    with pytest.raises(ValueError, match="non-negative"):
-        check_year(-9)
-
-    with pytest.raises(ValueError, match="unexpected year"):
-        # gets converted to 0
-        check_year(0.34)
-
-    with pytest.raises(ValueError, match="unexpected year"):
-        check_year("2222")
-
-
-def test_round_to_next_5():
-    cases = [
-        (1975, 1980),
-        (1976, 1980),
-        (1980, 1985),
-        (1981, 1985),
-        (1986, 1990),
-        (1988, 1990),
-    ]
-    for raw, expected in cases:
-        assert round_to_next_5(raw) == expected
-
-
-def test_infer_last_full_year():
-    cases = [
-        (1976, 1975),
-        (1981, 1980),
-        ("1986", 1985),
-        ("1999", 1995),
-    ]
-    for raw, expected in cases:
-        assert infer_last_full_year(raw) == expected
-
-
-def test_get_monthly_activity():
-    cases = [0, 11, 7, None]
-
-    for value in cases:
-        assert isinstance(get_monthly_activity(inactive_months=value), list)
-        assert len(get_monthly_activity(inactive_months=value)) == 12
-        assert all(
-            activity >= 0 for activity in get_monthly_activity(inactive_months=value)
+class TestImportCensusDataset:
+    def test_import_valid_file(self, data_dir_with_mock_csv, type_replacements):
+        result = import_census_dataset(
+            data_dir=data_dir_with_mock_csv, replacements=type_replacements
         )
-        assert abs(sum(get_monthly_activity(inactive_months=value)) - 1.0) < 1e-6
+        # FIXME unit="dw" seems useless?
 
-    with pytest.raises(ValueError, match="an int between"):
-        get_monthly_activity(inactive_months=-5)
+        assert isinstance(result, dict)
+        assert "1961" in result
+        df = result["1961"]
 
-    with pytest.raises(ValueError, match="an int between"):
-        get_monthly_activity(inactive_months=89)
+        assert "census_year" in df.columns
+        assert "vintage" in df.columns
+        assert df["census_year"].iloc[0] == "1961"
+        assert df["vintage"].iloc[2].strip() == "le-1920"
+        assert "apartments" in df.columns
+        # TODO: add tests for dataframe content?
 
+    def test_missing_replacements_raises(self, data_dir_with_mock_csv):
+        with pytest.raises(ValueError, match="replacements"):
+            import_census_dataset(data_dir=data_dir_with_mock_csv, replacements=None)
 
-def test_get_vintage_shares():
-    cases = [
-        ("1960-1961-1", None, [12 / 17, 5 / 17]),
-        ("1966-1971-1", None, [60 / 65, 5 / 65]),
-        ("1960-1961-1", 4, [8 / 9, 1 / 9]),
-        ("1966-1971-1", 4, [40 / 41, 1 / 41]),
-        ("1960-1961-1", 5, [1, 0]),
-        ("1966-1971-1", 5, [1, 0]),
-    ]
-    # FIXME these tests all assume census_month = 5, test for different census_month cutoffs
-    # TODO test different separators
+    def test_no_files_found_raises(self, tmp_path, type_replacements):
+        empty_dir = tmp_path / "census"
+        empty_dir.mkdir(parents=True, exist_ok=True)
+        with pytest.raises(ValueError, match="No census CSV files"):
+            import_census_dataset(data_dir=tmp_path, replacements=type_replacements)
 
-    for label, inactive_months, expected in cases:
-        assert get_vintage_shares(
-            label, sep="-", inactive_months=inactive_months
-        ) == pytest.approx(expected)
-
-    with pytest.raises(ValueError, match="Invalid vintage label"):
-        get_vintage_shares("1986-1")
-
-
-def test_extract_year_from_token_valid():
-    assert _extract_year_from_token("<1920", "<") == "le-1920"
-    assert _extract_year_from_token("1986+", "+") == "ge-1986"
-
-    with pytest.raises(ValueError):
-        _extract_year_from_token("hello", "<")
-
-    with pytest.raises(ValueError):
-        _extract_year_from_token("<abc", "<")
+    def test_bad_filename_raises(self, data_dir_with_bad_filename, type_replacements):
+        with pytest.raises(ValueError, match="valid 4-digit census year"):
+            import_census_dataset(
+                data_dir=data_dir_with_bad_filename,
+                replacements=type_replacements,
+            )
 
 
-def test_parse_single_vintage():
-    cases = [
-        ("total", 1991, True, [(1608, 2025)], [1.0]),
-        ("le-1920", 2001, True, [(1608, 1920)], [1.0]),
-        ("<1920", 2001, True, [(1608, 1920)], [1.0]),
-        ("1986+", 1986, True, [(1986, 1990)], [1.0]),
-        ("1986-1990", 1986, False, [(1986, 1986)], [1.0]),
-        ("1986-1990", 1986, True, [(1986, 1990)], [1.0]),
-        ("1986+", 1996, True, [(1986, 2000)], [1.0]),
-        # FIXME: for cases in -1, should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
-        ("1960-1961-1", 1961, True, [(1960, 1960), (1961, 1965)], [12 / 17, 5 / 17]),
-        ("1960-1961-1", 1961, False, [(1960, 1960), (1961, 1961)], [12 / 17, 5 / 17]),
-        ("1986-1", 1986, False, [(1986, 1986)], [1.0]),
-        ("1986-1", 1986, True, [(1986, 1990)], [1.0]),
-        ("1966-1971-1", 1971, True, [(1966, 1970), (1971, 1975)], [60 / 65, 5 / 65]),
-        ("1966-1971-1", 1971, False, [(1966, 1970), (1971, 1971)], [60 / 65, 5 / 65]),
-    ]  # NOTE years are inclusive - stock is measured at the end of year (consistent with ODYM definitions)
-    # FIXME the cases might need to be changed if the behaviour of "total" is modified to stop at census year.
+class TestCheckYear:
+    def test_check_year_invalid_inputs(self):
+        with pytest.raises(TypeError, match="Expected int or str convertible"):
+            check_year("nineteen")
 
-    for label, census_year, round_flag, expected_labels, expected_shares in cases:
-        new_labels, shares = parse_single_vintage(
-            label, census_year, round_last_vintage=round_flag
-        )
-        assert new_labels == expected_labels
-        assert shares == pytest.approx(expected_shares)
+        with pytest.raises(ValueError, match="unexpected year"):
+            check_year(True)
+
+        with pytest.raises(ValueError, match="non-negative"):
+            check_year(-9)
+
+        with pytest.raises(ValueError, match="unexpected year"):
+            # gets converted to 0
+            check_year(0.34)
+
+        with pytest.raises(ValueError, match="unexpected year"):
+            check_year("2222")
 
 
-def test_check_sums():
-    assert _check_sums([0.4, 0.6])
-    assert _check_sums(0.8, target=0.8)  # Check it accepts floats
-    assert _check_sums(0.8) is False
-
-    assert _check_sums(np.array([0.1, 0.2, 0.7]))
-    assert _check_sums(pd.Series([0.25, 0.75]))
-    assert _check_sums([0.3333, 0.6667], atol=1e-4)
-
-    with pytest.raises(TypeError):
-        _check_sums([0.1, "not a float", 0.9])
-
-    with pytest.raises(TypeError):
-        _check_sums("0.1,0.9")
-
-    with pytest.raises(ValueError):
-        _check_sums([0.1, 0.1, 0.5], raise_error=True)
+class TestRoundToNext5:
+    def test_round_to_next_5(self):
+        cases = [
+            (1975, 1980),
+            (1976, 1980),
+            (1980, 1985),
+            (1981, 1985),
+            (1986, 1990),
+            (1988, 1990),
+        ]
+        for raw, expected in cases:
+            assert round_to_next_5(raw) == expected
 
 
-def test_valid_data_preservation(original_row, valid_split_rows, data_columns):
-    result = _validate_data_preservation(
-        original_row=original_row,
-        new_rows=valid_split_rows,
-        data_columns=data_columns,
-        idx=42,
-        original_label="1960-1961-1",
-    )
-    assert result == valid_split_rows
+class TestInferLastFullYear:
+    def test_infer_last_full_year(self):
+        cases = [
+            (1976, 1975),
+            (1981, 1980),
+            ("1986", 1985),
+            ("1999", 1995),
+        ]
+        for raw, expected in cases:
+            assert infer_last_full_year(raw) == expected
 
 
-def test_invalid_data_preservation(original_row, invalid_split_rows, data_columns):
-    with pytest.raises(ValueError, match="Value mismatch after splitting row"):
-        _validate_data_preservation(
+class TestGetMonthlyActivity:
+    def test_get_monthly_activity_outputs(self):
+        cases = [0, 11, 7, None]
+
+        for value in cases:
+            assert isinstance(get_monthly_activity(inactive_months=value), list)
+            assert len(get_monthly_activity(inactive_months=value)) == 12
+            assert all(
+                activity >= 0
+                for activity in get_monthly_activity(inactive_months=value)
+            )
+            assert abs(sum(get_monthly_activity(inactive_months=value)) - 1.0) < 1e-6
+
+    def test_get_monthly_activity_invalid_inputs(self):
+        with pytest.raises(ValueError, match="an int between"):
+            get_monthly_activity(inactive_months=-5)
+
+        with pytest.raises(ValueError, match="an int between"):
+            get_monthly_activity(inactive_months=89)
+
+
+class TestGetVintageShares:
+    def test_get_vintage_shares(self):
+        cases = [
+            ("1960-1961-1", None, [12 / 17, 5 / 17]),
+            ("1966-1971-1", None, [60 / 65, 5 / 65]),
+            ("1960-1961-1", 4, [8 / 9, 1 / 9]),
+            ("1966-1971-1", 4, [40 / 41, 1 / 41]),
+            ("1960-1961-1", 5, [1, 0]),
+            ("1966-1971-1", 5, [1, 0]),
+        ]
+        # FIXME these tests all assume census_month = 5, test for different census_month cutoffs
+        # TODO test different separators
+
+        for label, inactive_months, expected in cases:
+            assert get_vintage_shares(
+                label, sep="-", inactive_months=inactive_months
+            ) == pytest.approx(expected)
+
+    def test_get_vintage_shares_invalid_label(self):
+        with pytest.raises(ValueError, match="Invalid vintage label"):
+            get_vintage_shares("1986-1")
+
+
+class TestExtractYearFromToken:
+    def test_extract_year_from_token_valid(self):
+        assert _extract_year_from_token("<1920", "<") == "le-1920"
+        assert _extract_year_from_token("1986+", "+") == "ge-1986"
+
+    def test_extract_year_from_token_invalid(self):
+        with pytest.raises(ValueError):
+            _extract_year_from_token("hello", "<")
+
+        with pytest.raises(ValueError):
+            _extract_year_from_token("<abc", "<")
+
+
+class TestParseSingleVintage:
+    def test_parse_single_vintage(self):
+        cases = [
+            ("total", 1991, True, [(1608, 2025)], [1.0]),
+            ("le-1920", 2001, True, [(1608, 1920)], [1.0]),
+            ("<1920", 2001, True, [(1608, 1920)], [1.0]),
+            ("1986+", 1986, True, [(1986, 1990)], [1.0]),
+            ("1986-1990", 1986, False, [(1986, 1986)], [1.0]),
+            ("1986-1990", 1986, True, [(1986, 1990)], [1.0]),
+            ("1986+", 1996, True, [(1986, 2000)], [1.0]),
+            # FIXME: for cases in -1, should add has a single year, not a block of years. Otherwise, it 'opens' the bounds of total too much. in 1986, total ends in 1986, not in 1990!
+            (
+                "1960-1961-1",
+                1961,
+                True,
+                [(1960, 1960), (1961, 1965)],
+                [12 / 17, 5 / 17],
+            ),
+            (
+                "1960-1961-1",
+                1961,
+                False,
+                [(1960, 1960), (1961, 1961)],
+                [12 / 17, 5 / 17],
+            ),
+            ("1986-1", 1986, False, [(1986, 1986)], [1.0]),
+            ("1986-1", 1986, True, [(1986, 1990)], [1.0]),
+            (
+                "1966-1971-1",
+                1971,
+                True,
+                [(1966, 1970), (1971, 1975)],
+                [60 / 65, 5 / 65],
+            ),
+            (
+                "1966-1971-1",
+                1971,
+                False,
+                [(1966, 1970), (1971, 1971)],
+                [60 / 65, 5 / 65],
+            ),
+        ]  # NOTE years are inclusive - stock is measured at the end of year (consistent with ODYM definitions)
+        # FIXME the cases might need to be changed if the behaviour of "total" is modified to stop at census year.
+
+        for label, census_year, round_flag, expected_labels, expected_shares in cases:
+            new_labels, shares = parse_single_vintage(
+                label, census_year, round_last_vintage=round_flag
+            )
+            assert new_labels == expected_labels
+            assert shares == pytest.approx(expected_shares)
+
+
+class TestCheckSums:
+    def test_check_sums_valid_inputs(self):
+        assert _check_sums([0.4, 0.6])
+        assert _check_sums(0.8, target=0.8)  # Check it accepts floats
+        assert _check_sums(0.8) is False
+
+        assert _check_sums(np.array([0.1, 0.2, 0.7]))
+        assert _check_sums(pd.Series([0.25, 0.75]))
+        assert _check_sums([0.3333, 0.6667], atol=1e-4)
+
+    def test_check_sums_invalid_inputs(self):
+        with pytest.raises(TypeError):
+            _check_sums([0.1, "not a float", 0.9])
+
+        with pytest.raises(TypeError):
+            _check_sums("0.1,0.9")
+
+        with pytest.raises(ValueError):
+            _check_sums([0.1, 0.1, 0.5], raise_error=True)
+
+
+class TestValidateDataPreservation:
+    def test_valid_data_preservation(
+        self, original_row, valid_split_rows, data_columns
+    ):
+        result = _validate_data_preservation(
             original_row=original_row,
-            new_rows=invalid_split_rows,
+            new_rows=valid_split_rows,
             data_columns=data_columns,
             idx=42,
             original_label="1960-1961-1",
         )
+        assert result == valid_split_rows
 
-
-def test_add_missing_vintages_types(
-    df_1991, historic_vintages, total_dwelling_types, tmp_path
-):
-    # Setup
-    result = add_missing_vintages_types(
-        dataframe=df_1991.copy(),
-        target_vintages=historic_vintages,
-        target_types=total_dwelling_types,
-        config_dir=tmp_path,  # ignored in this test
-        sep="-",
-    )
-    # === 1. Check all vintages are present ===
-    vintages_out = set(result["vintage"])
-    assert set(historic_vintages).issubset(vintages_out)
-
-    # === 2. Check all expected dwelling types exist as columns ===
-    for col in total_dwelling_types:
-        assert col in result.columns
-
-    # === 3. Check column order starts with census_year, vintage ===
-    assert result.columns[:2].tolist() == ["census_year", "vintage"]
-
-
-def test_missing_vintage_filling_logic(total_dwelling_types, tmp_path):
-    # Only a subset of vintages is present
-    df = pd.DataFrame(
-        {
-            "census_year": [2001],
-            "vintage": ["1946-1970"],
-            "total": [100],
-            "single_detached": [50],
-            "apartment_ge_5": [25],
-            "mobile": [25],
-        }
-    )
-
-    target_vintages = [
-        "1946-1970",
-        "2001-2005",
-        "2011-2015",
-    ]  # One before, one containing, and one after census_year
-    target_types = total_dwelling_types
-
-    result = add_missing_vintages_types(
-        dataframe=df.copy(),
-        target_vintages=target_vintages,
-        target_types=target_types,
-        config_dir=tmp_path,  # dummy path; not used
-        sep="-",
-    )
-
-    row_2011 = result[result["vintage"] == "2011-2015"].iloc[0]
-    row_2001 = result[result["vintage"] == "2001-2005"].iloc[0]
-    row_1946 = result[result["vintage"] == "1946-1970"].iloc[0]
-
-    # === Check zero fill for vintage after census year ===
-    for col in target_types:
-        assert row_2011[col] == 0 or np.isnan(row_2011[col]) is False
-        assert np.isnan(row_2001[col])
-
-    # === Check NaN preservation for original row ===
-    # Columns not originally present should be NaN in this row
-    missing_cols = set(target_types) - set(df.columns)
-    for col in missing_cols:
-        assert pd.isna(row_1946[col])
-
-
-def test_drop_duplicate_rows_only_keeps_one_nan(base_duplicate_df):
-    df = base_duplicate_df
-    meta_cols = ["vintage"]
-    data_cols = base_duplicate_df.columns.difference(meta_cols)
-
-    result = drop_duplicate_rows(df, meta_cols)
-
-    assert len(result) == 2  # one for 1946-1970, one for 1991-1995
-    assert result["vintage"].value_counts().max() == 1
-    assert result.loc[result["vintage"] == "1946-1970"].iloc[0][data_cols].isna().all()
-
-
-def test_drop_duplicate_rows_keeps_valid_row(base_duplicate_df):
-    df = base_duplicate_df
-    meta_cols = ["vintage"]
-
-    result = drop_duplicate_rows(df, meta_cols)
-
-    row = result[result["vintage"] == "1991-1995"].iloc[0]
-    assert row["single_detached"] == 10
-    assert row["mobile"] == 0
-
-
-def test_drop_duplicate_rows_raises_on_multiple_valid_rows(duplicate_with_conflict_df):
-    df = duplicate_with_conflict_df
-    meta_cols = ["vintage"]
-
-    with pytest.raises(
-        ValueError, match="Multiple non-NaN rows found for vintage '2001-2005'"
+    def test_invalid_data_preservation(
+        self, original_row, invalid_split_rows, data_columns
     ):
-        drop_duplicate_rows(df, meta_cols)
+        with pytest.raises(ValueError, match="Value mismatch after splitting row"):
+            _validate_data_preservation(
+                original_row=original_row,
+                new_rows=invalid_split_rows,
+                data_columns=data_columns,
+                idx=42,
+                original_label="1960-1961-1",
+            )
 
 
-def test_validate_vintage_interval():
-    valid_tuple = (1987, 1989)
-    invalid_tuple = (1986, 1985)
-    assert validate_vintage_interval(valid_tuple) is None
-
-    with pytest.raises(ValueError, match="Invalid vintage interval:"):
-        validate_vintage_interval(invalid_tuple)
-
-
-def test_vintage_label_to_tuple():
-    # FIXME add other tests for 'wrong' inputs; see normalize_vintage_labels
-    assert vintage_label_to_tuple("1986-1990") == (1986, 1990)
-
-    with pytest.raises(ValueError):
-        vintage_label_to_tuple(1982)
-
-    with pytest.raises(ValueError):
-        vintage_label_to_tuple("19829801")
-
-
-def test_calculate_missing_types_values(sample_df_to_sum, agg_types):
-    result = calculate_missing_types(sample_df_to_sum, agg_types)
-    assert result["apartments"].tolist() == [15, 11]
-
-
-def test_calculate_missing_types_preserves_original(sample_df_to_sum, agg_types):
-    # FIXME split tests in different files (e.g., one per function) then rename, preserves_original_if_not_inplace
-    _ = calculate_missing_types(sample_df_to_sum, agg_types)
-    assert sample_df_to_sum["apartments"].isna().all()
-
-
-def test_calculate_missing_types_modifies_if_inplace(sample_df_to_sum, agg_types):
-    calculate_missing_types(sample_df_to_sum, agg_types, inplace=True)
-    assert sample_df_to_sum["apartments"].tolist() == [15, 11]
-
-
-def test_validate_matching_frames(
-    matching_df, historic_vintages, data_columns, original_df
-):
-    assert (
-        _validate_frame_preservation(
-            original_df, matching_df, historic_vintages, data_columns
+class TestAddMissingVintagesTypes:
+    def test_add_missing_vintages_types(
+        self, df_1991, historic_vintages, total_dwelling_types, tmp_path
+    ):
+        # Setup
+        result = add_missing_vintages_types(
+            dataframe=df_1991.copy(),
+            target_vintages=historic_vintages,
+            target_types=total_dwelling_types,
+            config_dir=tmp_path,  # ignored in this test
+            sep="-",
         )
-        is None
-    )
+        # === 1. Check all vintages are present ===
+        vintages_out = set(result["vintage"])
+        assert set(historic_vintages).issubset(vintages_out)
 
+        # === 2. Check all expected dwelling types exist as columns ===
+        for col in total_dwelling_types:
+            assert col in result.columns
 
-def test_validate_within_tolerance(
-    slightly_modified_df, historic_vintages, data_columns, original_df
-):
-    assert (
-        _validate_frame_preservation(
-            original_df, slightly_modified_df, historic_vintages, data_columns
+        # === 3. Check column order starts with census_year, vintage ===
+        assert result.columns[:2].tolist() == ["census_year", "vintage"]
+
+    def test_missing_vintage_filling_logic(self, total_dwelling_types, tmp_path):
+        # Only a subset of vintages is present
+        df = pd.DataFrame(
+            {
+                "census_year": [2001],
+                "vintage": ["1946-1970"],
+                "total": [100],
+                "single_detached": [50],
+                "apartment_ge_5": [25],
+                "mobile": [25],
+            }
         )
-        is None
-    )
 
+        target_vintages = [
+            "1946-1970",
+            "2001-2005",
+            "2011-2015",
+        ]  # One before, one containing, and one after census_year
+        target_types = total_dwelling_types
 
-def test_validate_outside_tolerance(
-    significantly_modified_df, historic_vintages, data_columns, original_df
-):
-    with pytest.raises(ValueError, match="Frame mismatch"):
-        _validate_frame_preservation(
-            original_df, significantly_modified_df, historic_vintages, data_columns
+        result = add_missing_vintages_types(
+            dataframe=df.copy(),
+            target_vintages=target_vintages,
+            target_types=target_types,
+            config_dir=tmp_path,  # dummy path; not used
+            sep="-",
         )
+
+        row_2011 = result[result["vintage"] == "2011-2015"].iloc[0]
+        row_2001 = result[result["vintage"] == "2001-2005"].iloc[0]
+        row_1946 = result[result["vintage"] == "1946-1970"].iloc[0]
+
+        # === Check zero fill for vintage after census year ===
+        for col in target_types:
+            assert row_2011[col] == 0 or np.isnan(row_2011[col]) is False
+            assert np.isnan(row_2001[col])
+
+        # === Check NaN preservation for original row ===
+        # Columns not originally present should be NaN in this row
+        missing_cols = set(target_types) - set(df.columns)
+        for col in missing_cols:
+            assert pd.isna(row_1946[col])
+
+
+class TestDropDuplicateRows:
+    def test_drop_duplicate_rows_only_keeps_one_nan(self, base_duplicate_df):
+        df = base_duplicate_df
+        meta_cols = ["vintage"]
+        data_cols = base_duplicate_df.columns.difference(meta_cols)
+
+        result = drop_duplicate_rows(df, meta_cols)
+
+        assert len(result) == 2  # one for 1946-1970, one for 1991-1995
+        assert result["vintage"].value_counts().max() == 1
+        assert (
+            result.loc[result["vintage"] == "1946-1970"].iloc[0][data_cols].isna().all()
+        )
+
+    def test_drop_duplicate_rows_keeps_valid_row(self, base_duplicate_df):
+        df = base_duplicate_df
+        meta_cols = ["vintage"]
+
+        result = drop_duplicate_rows(df, meta_cols)
+
+        row = result[result["vintage"] == "1991-1995"].iloc[0]
+        assert row["single_detached"] == 10
+        assert row["mobile"] == 0
+
+    def test_drop_duplicate_rows_raises_on_multiple_valid_rows(
+        self, duplicate_with_conflict_df
+    ):
+        df = duplicate_with_conflict_df
+        meta_cols = ["vintage"]
+
+        with pytest.raises(
+            ValueError, match="Multiple non-NaN rows found for vintage '2001-2005'"
+        ):
+            drop_duplicate_rows(df, meta_cols)
+
+
+class TestVintageValidation:
+    def test_validate_vintage_interval(self):
+        valid_tuple = (1987, 1989)
+        invalid_tuple = (1986, 1985)
+        assert validate_vintage_interval(valid_tuple) is None
+
+        with pytest.raises(ValueError, match="Invalid vintage interval:"):
+            validate_vintage_interval(invalid_tuple)
+
+    def test_vintage_label_to_tuple(self):
+        # FIXME add other tests for 'wrong' inputs; see normalize_vintage_labels
+        assert vintage_label_to_tuple("1986-1990") == (1986, 1990)
+
+        with pytest.raises(ValueError):
+            vintage_label_to_tuple(1982)
+
+        with pytest.raises(ValueError):
+            vintage_label_to_tuple("19829801")
+
+
+class TestCalculateMissingTypes:
+    def test_calculate_missing_types_values(self, sample_df_to_sum, agg_types):
+        result = calculate_missing_types(sample_df_to_sum, agg_types)
+        assert result["apartments"].tolist() == [15, 11]
+
+    def test_calculate_missing_types_preserves_original(
+        self, sample_df_to_sum, agg_types
+    ):
+        # FIXME split tests in different files (e.g., one per function) then rename, preserves_original_if_not_inplace
+        _ = calculate_missing_types(sample_df_to_sum, agg_types)
+        assert sample_df_to_sum["apartments"].isna().all()
+
+    def test_calculate_missing_types_modifies_if_inplace(
+        self, sample_df_to_sum, agg_types
+    ):
+        calculate_missing_types(sample_df_to_sum, agg_types, inplace=True)
+        assert sample_df_to_sum["apartments"].tolist() == [15, 11]
+
+
+class TestFramePreservation:
+    def test_validate_matching_frames(
+        self, matching_df, historic_vintages, data_columns, original_df
+    ):
+        assert (
+            _validate_frame_preservation(
+                original_df, matching_df, historic_vintages, data_columns
+            )
+            is None
+        )
+
+    def test_validate_within_tolerance(
+        self, slightly_modified_df, historic_vintages, data_columns, original_df
+    ):
+        assert (
+            _validate_frame_preservation(
+                original_df, slightly_modified_df, historic_vintages, data_columns
+            )
+            is None
+        )
+
+    def test_validate_outside_tolerance(
+        self, significantly_modified_df, historic_vintages, data_columns, original_df
+    ):
+        with pytest.raises(ValueError, match="Frame mismatch"):
+            _validate_frame_preservation(
+                original_df, significantly_modified_df, historic_vintages, data_columns
+            )
 
 
 class TestCheckSeriesSum:  # FIXME rename _check_sums?
