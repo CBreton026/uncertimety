@@ -1,3 +1,20 @@
+"""
+Census Data Preparation Module
+
+This module handles the import, cleaning, and transformation of census data
+for the uncertimety project. It provides functions for:
+- Importing and cleaning census datasets
+- Harmonizing vintage labels across datasets
+- Standardizing dwelling type categories
+- Validating data consistency
+
+Usage:
+    from uncertimety.dataprep import import_census_dataset
+
+    # Import census data
+    datasets = import_census_dataset(replacements=config["census"]["type_map"])
+"""
+
 import re
 import toml
 import itertools
@@ -23,13 +40,33 @@ if not CONFIG.exists():
     logger.error(msg)
     raise FileNotFoundError(msg)
 
-try:
-    config = load_config(CONFIG)
-except (FileNotFoundError, toml.TomlDecodeError) as err:
-    logger.error(f"Failed to load configuration from {CONFIG}: {err}")
-    raise
+
+def load_dataset_config(config_path: Path) -> Dict:
+    """Load and validate the dataset configuration."""
+    try:
+        config = load_config(config_path)
+        required_keys = [
+            "dwelling_stock.metadata",
+            "dwelling_stock.historic_vintages",
+            "dwelling_stock.target_dwelling_types",
+        ]
+
+        for key_path in required_keys:
+            parts = key_path.split(".")
+            temp = config
+            for part in parts:
+                if part not in temp:
+                    raise KeyError(f"Missing key: {key_path}")
+                temp = temp[part]
+
+        return config
+    except (FileNotFoundError, toml.TomlDecodeError) as err:
+        logger.error(f"Failed to load configuration from {config_path}: {err}")
+        raise
+
 
 try:
+    config = load_dataset_config(CONFIG)
     META_COLS = config["dwelling_stock"]["metadata"]
     HISTORIC_VINTAGES = config["dwelling_stock"]["historic_vintages"]
     TARGET_TYPES = config["dwelling_stock"]["target_dwelling_types"]
@@ -173,7 +210,7 @@ def import_census_dataset(
     infiles = list(pattern.parent.glob(pattern.name))
 
     if not infiles:
-        msg = f"No census CSV files found in path: {pattern}"
+        msg = f"No census CSV files found in path: {pattern}. Check that the data directory exists and contains CSV files matching the pattern."
         logger.error(msg)
         raise ValueError(msg)
 
@@ -1342,10 +1379,9 @@ def merge_unique_ordered(*lists: List[Any]) -> List[Any]:
 
 
 def validate_dwelling_counts(
-        df: pd.DataFrame,
-        inplace: bool = False,
-    ):
-
+    df: pd.DataFrame,
+    inplace: bool = False,
+):
     working_df = df if inplace else df.copy()
 
     # TODO reprendre ici; voir ce que j'avais déjà codé précédemment si parties réutilisables.
@@ -1363,6 +1399,32 @@ def validate_dwelling_counts(
     return working_df
 
 
+def process_census_dataframe(df, census_year):
+    """Process a single census dataframe through the full pipeline."""
+
+    logger.info("Harmonizing census %d", int(census_year))
+    df = harmonize_vintage_labels(df, sep="-", model_start=1608)
+
+    logger.info("Expanding census %d with missing types and vintages", int(census_year))
+    df = add_missing_vintages_types(df)
+
+    logger.info("Converting census %d data to nullable Int32.", int(census_year))
+    convert_df_to_int(df, inplace=True)
+
+    logger.info(
+        "Filling census %d aggregate types by summing over subtypes",
+        int(census_year),
+    )
+    df = calculate_missing_types(df)
+
+    logger.info(
+        "Extracting relevant subset for census %d",
+        int(census_year),
+    )
+    df = standardize_census(df)
+    return df
+
+
 if __name__ == "__main__":
     # Set program-level rng seed
     auto_seed_from_config()
@@ -1376,44 +1438,15 @@ if __name__ == "__main__":
 
     overwritten = overwrite_census_dataset(census_dw)
 
-    # TODO check for memory issues here. not super efficient to have four copies of dataframe
-    harmonized = {}  # TODO rename to something more meaningful
-    expanded = {}  # TODO rename to something more meaningful
-    summed = {}  # TODO rename to something more meaningful
-    standardized = {}
+    standardized_data = {
+        year: process_census_dataframe(df, year) for year, df in overwritten.items()
+    }
 
-    for census_year, df in overwritten.items():
-        logger.info("Harmonizing census %d", int(census_year))
-        harmonized[census_year] = harmonize_vintage_labels(
-            df, sep="-", model_start=1608
-        )
-
-        logger.info(
-            "Expanding census %d with missing types and vintages", int(census_year)
-        )
-        expanded[census_year] = add_missing_vintages_types(harmonized[census_year])
-
-        logger.info("Converting census %d data to nullable Int32.", int(census_year))
-        convert_df_to_int(expanded[census_year], inplace=True)
-
-        logger.info(
-            "Filling census %d aggregate types by summing over subtypes",
-            int(census_year),
-        )
-        summed[census_year] = calculate_missing_types(expanded[census_year])
-
-        logger.info(
-            "Extracting relevant subset for census %d",
-            int(census_year),
-        )
-        standardized[census_year] = standardize_census(summed[census_year])
-        # TODO IPFN
-
-    for census_year in standardized:
-        display(standardized[census_year])
+    for census_year in standardized_data:
+        display(standardized_data[census_year])
 
     # save as temporary html
-    dataset = pd.concat(standardized).sort_index()
+    dataset = pd.concat(standardized_data).sort_index()
     dataset = filter_relevant_types_vintages(
         dataset, meta_cols=["census_year", "vintage"]
     )
