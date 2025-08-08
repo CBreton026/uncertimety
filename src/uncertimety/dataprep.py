@@ -1398,10 +1398,11 @@ def validate_dwelling_counts(
     # IF there are issues, then launch IPFN procedure (?)
     return working_df
 
+
 def check_series_sum(
     df: pd.DataFrame,
     target: str,  # either a row or column label
-    group_by: str = 'vintage',
+    groupby: str = "vintage",
     total_label: str = None,
     atol: float = 5,
     rtol: float = 1e-5,
@@ -1409,144 +1410,163 @@ def check_series_sum(
 ) -> Tuple[bool, pd.Series]:
     """
     Check if components sum to total within grouped data.
-    
+
     Args:
         df: DataFrame with data to check
         value_col: Column containing values to sum (e.g., 'total')
-        group_by: Column to group by (e.g., 'vintage')
-        vintage_total: Label in group_by representing the total
+        groupby: Column to group by (e.g., 'vintage')
+        vintage_total: Label in groupby representing the total
         atol: Absolute tolerance for comparison (used by np.isclose)
         rtol: Relative tolerance for comparison (used by np.isclose)
-        
+
     Returns:
         Tuple of (bool, Series) where:
             - bool indicates if all groups pass the check
             - Series contains the difference between total and sum of components for each group
     """
     if total_label is None:
-        total_label = 'total' if axis == 0 else '1608-2025'  # FIXME use constants?
+        total_label = "total" if axis == 0 else "1608-2025"  # FIXME use constants?
 
-    grouped = df.groupby(group_by).sum()
+    grouped = df.groupby(groupby).sum()
 
     if axis == 0:  # for rows, sum over types
         try:
             total = grouped.loc[target, total_label]
             components = grouped.loc[target].drop(total_label)
         except KeyError as err:
-            raise KeyError(f"Target '{target}' not found in DataFrame {grouped.index}: {err}. Check that target and axis are consistent.")
+            raise KeyError(
+                f"Target '{target}' not found in DataFrame {grouped.index}: {err}. Check that target and axis are consistent."
+            )
     elif axis == 1:  # for columns, sum over vintages
         try:
             total = grouped.loc[total_label, target]
             components = grouped[target].drop(total_label)
         except KeyError as err:
-            raise KeyError(f"Target '{target}' not found in DataFrame {grouped.columns}: {err}")
+            raise KeyError(
+                f"Target '{target}' not found in DataFrame {grouped.columns}: {err}"
+            )
     else:
         raise ValueError(f"Invalid axis {axis}. Use 0 for rows or 1 for columns.")
 
     # Sum the components
     component_sum = components.fillna(0).sum()
-    
+
     # Calculate difference
     difference = total - component_sum
-    
+
     # Check if within tolerance (using numpy's isclose for both absolute and relative tolerance)
     check_passed = np.isclose(total, component_sum, rtol=rtol, atol=atol)
-    
-    result = pd.Series({
-        'target': target,
-        'total_label': total_label,
-        'total': total,
-        'component_sum': component_sum,
-        'difference': difference,
-        'check_passed': check_passed
-    })
-    
+
+    result = pd.Series(
+        {
+            "target": target,
+            "total_label": total_label,
+            "total": total,
+            "component_sum": component_sum,
+            "difference": difference,
+            "check_passed": check_passed,
+        }
+    )
+
     return check_passed, result
 
 
 # TODO Reprendre check_marginals
 def check_marginals(
-    df: pd.DataFrame, 
-    vintage: str = "1608-2025", 
-    dwelling_type: str = "total",
+    df: pd.DataFrame,
+    groupby: str = "vintage",
+    vintage_label: str = "1608-2025",
+    type_label: str = "total",
     atol: float = 5,
-    rtol: float = 1e-5
-) -> bool:
+    rtol: float = 1e-5,
+) -> Tuple[bool, Dict[str, Any]]:
     """
     Check if the marginals (total counts) are consistent across vintages and types.
-    
+
     Args:
         df: DataFrame with vintage and dwelling type data
-        vintage: The vintage label representing the total (e.g., "1608-2025")
-        dwelling_type: The column name representing total dwellings (e.g., "total")
+        groupby: Column containing vintage labels (e.g., 'vintage')
+        vintage_label: The vintage label representing the total (e.g., "1608-2025")
+        type_label: The column name representing total dwellings (e.g., "total")
         atol: Absolute tolerance for comparison
         rtol: Relative tolerance for comparison
-        
+
     Returns:
-        bool: True if the marginals are consistent, else False
+        Tuple[bool, Dict]:
+            - Boolean indicating if marginals are consistent
+            - Dictionary with detailed results including:
+                - 'sum_by_type': Series with type sum details
+                - 'sum_by_vintage': Series with vintage sum details
+                - 'sums_match': Whether component sums match
+                - 'difference': Difference between component sums
     """
     # Check that required columns exist
-    if 'vintage' not in df.columns:
-        logger.error("DataFrame does not contain 'vintage' column.")
-        raise ValueError("DataFrame does not contain 'vintage' column.")
+    if type_label not in df.columns or groupby not in df.columns:
+        msg = f"Columns {type_label} or {groupby} are missing from DataFrame columns: {df.columns}"
+        logger.error(msg)
+        raise ValueError(msg)
 
-    if dwelling_type not in df.columns:
-        logger.error(f"{dwelling_type} column not found in DataFrame.")
-        raise ValueError(f"{dwelling_type} column not found in DataFrame.")
-
-    # Find appropriate vintage if specified one isn't available
-    if vintage not in df["vintage"].values:
-        logger.warning(f"Vintage '{vintage}' not found in DataFrame. Using vintage of max '{dwelling_type}' value instead.")
-        vintage = df.loc[df[dwelling_type].idxmax(), 'vintage']
+    # Check that the required vintage label exists in the groupby column
+    if vintage_label not in df[groupby].values:
+        msg = f"Vintage label '{vintage_label}' not found in '{groupby}' column: {df[groupby].unique()}"
+        logger.error(msg)
+        raise ValueError(msg)
 
     try:
-        # Check if dwelling type values sum to the total vintage value
-        dwelling_passed, dwelling_details = check_series_sum(
-            df=df, 
-            group_col='vintage',
-            value_col=dwelling_type,
-            total_label=vintage,
-            atol=atol,
-            rtol=rtol
+        # Check if dwelling types sum to the vintage total
+        type_passed, sum_by_type = check_series_sum(
+            df, target=vintage_label, groupby=groupby, atol=atol, rtol=rtol, axis=0
         )
-        
-        # Check if vintage values sum to the total dwelling type value
-        # Get the row for the specified vintage
-        vintage_row = df.loc[df['vintage'] == vintage].iloc[0]
-        vintage_df = pd.DataFrame(vintage_row).T.reset_index(drop=True)
-        
-        vintage_passed, vintage_details = check_sums(
-            df=vintage_df,
-            group_col='vintage',  # This is just a placeholder since we're working with a single row
-            value_col=dwelling_type,
-            total_label=vintage,  # This ensures we get the right row
-            atol=atol,
-            rtol=rtol
+
+        # Check if vintages sum to the type total
+        vintage_passed, sum_by_vintage = check_series_sum(
+            df, target=type_label, groupby=groupby, atol=atol, rtol=rtol, axis=1
         )
-        
-        if not dwelling_passed or not vintage_passed:
-            logger.warning(
-                f"Marginal check failed: dwelling series check_passed={dwelling_passed} "
-                f"or vintage series check_passed={vintage_passed}"
+        # There are two things we need to check: first, that the component sums match for types and vintages agree; second, that this matches the total value
+
+        # Compare the component sums from both approaches (should be equal)
+        sums_match = np.isclose(
+            sum_by_type["component_sum"],
+            sum_by_vintage["component_sum"],
+            atol=atol,
+            rtol=rtol,
+        )
+
+        difference = sum_by_type["component_sum"] - sum_by_vintage["component_sum"]
+
+        # Combine all checks
+        all_passed = type_passed and vintage_passed and sums_match
+
+        results = {
+            "sum_by_type": sum_by_type,
+            "sum_by_vintage": sum_by_vintage,
+            "sums_match": sums_match,
+            "difference": difference,
+        }
+
+        if all_passed:
+            logger.info(
+                f"Marginal check passed: type sum {sum_by_type['component_sum']} "
+                f"and vintage sum {sum_by_vintage['component_sum']} agree."
             )
-            return False
-        
-        # Additionally check if the totals from both approaches are consistent
-        dwelling_total = dwelling_details['total_value']
-        vintage_total = vintage_details['total_value']
-        
-        if not np.isclose(dwelling_total, vintage_total, atol=atol, rtol=rtol):
-            logger.warning(
-                f"Marginal check failed: dwelling total {dwelling_total} vs vintage total {vintage_total} "
-                f"for {dwelling_type} in vintage {vintage}"
-            )
-            return False
-            
+        else:
+            if sums_match:
+                logger.warning(
+                    f"Marginal check failed: component sums match {sum_by_type['component_sum']}, but differ from total {sum_by_type['total']}. Check dataset for errors."
+                )
+                # TODO return all_passed True here?
+            else:
+                logger.warning(
+                    f"Marginal check failed: component sums don't match type_passed={type_passed}, "
+                    f"vintage_passed={vintage_passed}, sums_match={sums_match}, "
+                    f"difference={difference}"
+                )
     except KeyError as err:
         logger.error(f"Error checking marginals: {err}")
-        return False
-        
-    return True
+        return False, {"error": str(err)}
+
+    return all_passed, results
+
 
 def process_census_dataframe(df, census_year):
     """Process a single census dataframe through the full pipeline."""
@@ -1601,3 +1621,58 @@ if __name__ == "__main__":
     )
     dataset.to_html("./temp.html")
 
+    # TODO: standardize the dataset AFTER the IPFN procedure, as we need 'all' dwellings to be balanced. Therefore, I need to treat the other_dwelling / other_attached dwelling for consistency.
+
+# TODO Refactor this file as a module, and separate the functions into different .py files (i.e., separation of concerns). Check for DRY and code smells.
+
+# FIXME change all references to atol and rtol to values from config file?
+
+# TODO Reprendre à "redefine target cohorts" in dmfa_dataprep.ipynb, AND Check_sums - also have a look at round_consistent_sum, fix_marginals, and res_fix
+
+
+# TODO compare to dwellings 1685-2021.csv ?
+
+# TODO: look at def check_sums in the ipynb files; it seems to be the start of the IPFN procedure. Then, in interpolating the missing data, I discuss padding backwards. however, why not set zeros to known values, then interpolate linearly, but backwards?
+# IMPORTANTLY : "The 'masks' saved here will be useful to identify: 1 - which census have interpolated data (which previously had nans), 2 - what data was known before the interpolation, to prevent the IPFN of modifying these values" I'll want to keep the Nans and relevant totals (as marginals) for the IPFN procedure. "
+# TODO round_consistent_sum
+# TODO fix_marginals
+# TODO: look at the 'corrected' values below, and at everything with "_fix" suffix
+# TODO: compare with the exported dataset to see if I get the same results
+
+# TODO, CHECK these values e.g., in manual overwrites. there are expected issues (in check_sums) for:
+"""
+# 1961
+# Fix 1961 total
+# Sums over cohorts and types both lead to the same value for total, when all other sums agree; where are the missing 7_000?
+csdw_c["1961"].loc[0, "total"] = 1191368.0
+
+# 1986
+# cohorts are close (~175), types is wrong by 1M because of the undefined single attached and apartment types. When summing over all available types, the results are fine.
+# NOTE Using CHASS data breaks the individual type sums (by cohorts)
+# csdw_c['1986'].loc[0,'total'] = 2_357_100
+# csdw_c['1986'].loc[0,'single_detached'] = 1_032_600
+# csdw_c['1986'].loc[0,'apartment>5'] = 116_120
+# csdw_c['1986'].loc[0,'mobile'] = 16_950
+# csdw_c['1986'].loc[0,'other_attached_dwelling'] = 1_191_440
+# csdw_c['1986'].drop(2).iloc[1:,2].sum()
+
+# 1991
+# cohorts are fine, types are close (~390)
+csdw_c["1991"].loc[0, "single_detached"] = 1_175_085  # CHASS data; found the mistake
+csdw_c["1991"].loc[0, "apartment>5"] = 137_105  # CHASS data; found the mistake
+csdw_c["1991"].loc[0, "mobile"] = 24_720  # CHASS data; found the mistake
+csdw_c["1991"].loc[0, "apartments"] = (
+    csdw_c["1991"].loc[0, combined_types["apartments"]].sum()
+)
+# csdw_c['1991'].drop(2).iloc[1:,2].sum()
+
+# 1996
+# cohorts are fine, types need fixing
+csdw_c["1996"].loc[0, "apartment_duplex"] = 171_265  # CHASS data; found the mistake
+csdw_c["1996"].loc[0, "apartments"] = (
+    csdw_c["1996"].loc[0, combined_types["apartments"]].sum()
+)
+# csdw_c['1996'].drop(2).iloc[1:,2].sum()
+
+"""
+# TODO et, plus tard, "# Autres ajouts manuels, à réviser # FIXME"
