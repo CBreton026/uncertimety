@@ -24,6 +24,7 @@ from pathlib import Path
 from math import isclose
 from typing import Optional, Dict, List, Tuple, Union, Iterable, Any
 from pandas import testing as tm
+from dataclasses import dataclass
 from uncertimety.logger import init_logger
 from uncertimety.config_loader import load_config
 from uncertimety.random_control import auto_seed_from_config, PY_RANDOM, NP_RANDOM
@@ -1097,8 +1098,9 @@ def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
         raise ValueError(f"Invalid vintage label format: {label}")
 
 
-def convert_df_to_int(
+def convert_num_types(
     df: pd.DataFrame,
+    dtype: str = "Int32",
     meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
     inplace: bool = False,
 ) -> pd.DataFrame:
@@ -1119,7 +1121,7 @@ def convert_df_to_int(
     # Safely convert only numeric (float/int) columns
     for col in data_cols:
         if pd.api.types.is_numeric_dtype(working_df[col]):
-            working_df[col] = working_df[col].astype("Int32")
+            working_df[col] = working_df[col].astype(dtype)
 
     return working_df
 
@@ -1399,79 +1401,53 @@ def validate_dwelling_counts(
     return working_df
 
 
-def check_series_sum(
-    df: pd.DataFrame,
-    target: str,  # either a row or column label
-    groupby: str = "vintage",
-    total_label: str = None,
-    atol: float = 5,
-    rtol: float = 1e-5,
-    axis: bool = 0,
-) -> Tuple[bool, pd.Series]:
-    """
-    Check if components sum to total within grouped data.
-
-    Args:
-        df: DataFrame with data to check
-        value_col: Column containing values to sum (e.g., 'total')
-        groupby: Column to group by (e.g., 'vintage')
-        vintage_total: Label in groupby representing the total
-        atol: Absolute tolerance for comparison (used by np.isclose)
-        rtol: Relative tolerance for comparison (used by np.isclose)
-
-    Returns:
-        Tuple of (bool, Series) where:
-            - bool indicates if all groups pass the check
-            - Series contains the difference between total and sum of components for each group
-    """
-    if total_label is None:
-        total_label = "total" if axis == 0 else "1608-2025"  # FIXME use constants?
-
-    grouped = df.groupby(groupby).sum()
-
-    if axis == 0:  # for rows, sum over types
-        try:
-            total = grouped.loc[target, total_label]
-            components = grouped.loc[target].drop(total_label)
-        except KeyError as err:
-            raise KeyError(
-                f"Target '{target}' not found in DataFrame {grouped.index}: {err}. Check that target and axis are consistent."
-            )
-    elif axis == 1:  # for columns, sum over vintages
-        try:
-            total = grouped.loc[total_label, target]
-            components = grouped[target].drop(total_label)
-        except KeyError as err:
-            raise KeyError(
-                f"Target '{target}' not found in DataFrame {grouped.columns}: {err}"
-            )
-    else:
-        raise ValueError(f"Invalid axis {axis}. Use 0 for rows or 1 for columns.")
-
-    # Sum the components
-    component_sum = components.fillna(0).sum()
-
-    # Calculate difference
-    difference = total - component_sum
-
-    # Check if within tolerance (using numpy's isclose for both absolute and relative tolerance)
-    check_passed = np.isclose(total, component_sum, rtol=rtol, atol=atol)
-
-    result = pd.Series(
-        {
-            "target": target,
-            "total_label": total_label,
-            "total": total,
-            "component_sum": component_sum,
-            "difference": difference,
-            "check_passed": check_passed,
-        }
-    )
-
-    return check_passed, result
+@dataclass
+class MarginalCheckResult:
+    diff_types: pd.Series
+    types_passed: pd.Series
+    diff_vintages: pd.Series
+    vintages_passed: pd.Series
+    marginal_totals: pd.Series
+    marginals_passed: pd.Series
+    diff_marginals: pd.Series
+    nan_count: int
+    nan_loc: pd.Series
+    marginals_match: bool
+    all_passed: bool
 
 
-# TODO Reprendre check_marginals
+def _compute_expected_marginals(
+    df: pd.DataFrame, vintage_label: str, type_label: str
+) -> tuple:
+    """Extract expected sums for the given vintage and type totals."""
+    expected_total = df.loc[vintage_label, type_label]
+    expected_sum_over_types = df.drop(vintage_label).loc[:, type_label]
+    expected_sum_over_vintages = df.drop(type_label, axis=1).loc[vintage_label]
+    return expected_total, expected_sum_over_types, expected_sum_over_vintages
+
+
+def _compare_with_tolerance(
+    expected, actual, atol: float, rtol: float
+) -> tuple[pd.Series, pd.Series]:
+    """Return (difference, passed) tuple."""
+    diff = actual - expected
+    passed = np.isclose(expected, actual, atol=atol, rtol=rtol)
+    return diff, passed
+
+
+def _check_nans(
+    df,
+) -> tuple[pd.Series, pd.Series]:
+    """Return (difference, passed) tuple."""
+    nan_count = df.isna().sum().sum()
+    nan_loc = [
+        (df.index.to_list()[vintage_index], df.columns.to_list()[type_index])
+        for vintage_index, type_index in np.argwhere(np.isnan(df))
+    ]
+
+    return nan_count, nan_loc
+
+
 def check_marginals(
     df: pd.DataFrame,
     groupby: str = "vintage",
@@ -1479,93 +1455,125 @@ def check_marginals(
     type_label: str = "total",
     atol: float = 5,
     rtol: float = 1e-5,
-) -> Tuple[bool, Dict[str, Any]]:
+) -> MarginalCheckResult:
     """
     Check if the marginals (total counts) are consistent across vintages and types.
 
-    Args:
-        df: DataFrame with vintage and dwelling type data
-        groupby: Column containing vintage labels (e.g., 'vintage')
-        vintage_label: The vintage label representing the total (e.g., "1608-2025")
-        type_label: The column name representing total dwellings (e.g., "total")
-        atol: Absolute tolerance for comparison
-        rtol: Relative tolerance for comparison
-
-    Returns:
-        Tuple[bool, Dict]:
-            - Boolean indicating if marginals are consistent
-            - Dictionary with detailed results including:
-                - 'sum_by_type': Series with type sum details
-                - 'sum_by_vintage': Series with vintage sum details
-                - 'sums_match': Whether component sums match
-                - 'difference': Difference between component sums
+    Raises:
+        KeyError: If required labels/columns are missing.
     """
-    # Check that required columns exist
-    if type_label not in df.columns or groupby not in df.columns:
-        msg = f"Columns {type_label} or {groupby} are missing from DataFrame columns: {df.columns}"
-        logger.error(msg)
-        raise ValueError(msg)
-
-    # Check that the required vintage label exists in the groupby column
+    if groupby not in df.columns:
+        raise KeyError(f"Missing groupby column '{groupby}' in DataFrame.")
     if vintage_label not in df[groupby].values:
-        msg = f"Vintage label '{vintage_label}' not found in '{groupby}' column: {df[groupby].unique()}"
-        logger.error(msg)
-        raise ValueError(msg)
+        raise KeyError(f"Missing vintage label '{vintage_label}'.")
+    if type_label not in df.columns:
+        raise KeyError(f"Missing type label '{type_label}'.")
 
-    try:
-        # Check if dwelling types sum to the vintage total
-        type_passed, sum_by_type = check_series_sum(
-            df, target=vintage_label, groupby=groupby, atol=atol, rtol=rtol, axis=0
-        )
+    working_df = df.copy().set_index(groupby)
 
-        # Check if vintages sum to the type total
-        vintage_passed, sum_by_vintage = check_series_sum(
-            df, target=type_label, groupby=groupby, atol=atol, rtol=rtol, axis=1
-        )
-        # There are two things we need to check: first, that the component sums match for types and vintages agree; second, that this matches the total value
+    # Get nan data
+    nan_count, nan_loc = _check_nans(working_df)
 
-        # Compare the component sums from both approaches (should be equal)
-        sums_match = np.isclose(
-            sum_by_type["component_sum"],
-            sum_by_vintage["component_sum"],
-            atol=atol,
-            rtol=rtol,
-        )
+    # Overwrite nans for sums
+    working_df = working_df.fillna(0)
 
-        difference = sum_by_type["component_sum"] - sum_by_vintage["component_sum"]
+    # Extract expected values
+    expected_total, expected_sum_over_types, expected_sum_over_vintages = (
+        _compute_expected_marginals(working_df, vintage_label, type_label)
+    )
 
-        # Combine all checks
-        all_passed = type_passed and vintage_passed and sums_match
-
-        results = {
-            "sum_by_type": sum_by_type,
-            "sum_by_vintage": sum_by_vintage,
-            "sums_match": sums_match,
-            "difference": difference,
+    marginal_totals = pd.Series(
+        {
+            "expected_sum_over_types": expected_sum_over_types.sum(),
+            "expected_sum_over_vintages": expected_sum_over_vintages.sum(),
         }
+    )
 
-        if all_passed:
-            logger.info(
-                f"Marginal check passed: type sum {sum_by_type['component_sum']} "
-                f"and vintage sum {sum_by_vintage['component_sum']} agree."
+    # Drop the total row (e.g., '1608-2025') and total column (e.g., 'total') for the actual sums
+    reduced_df = working_df.drop(vintage_label).drop(type_label, axis=1)
+
+    # Sum over types (columns), should be equal to 'total'
+    sum_over_types = reduced_df.sum(axis=1)
+    diff_types, types_passed = _compare_with_tolerance(
+        expected_sum_over_types, sum_over_types, atol, rtol
+    )
+
+    # Sum over vintages (rows), should be equal to '1608-2025'
+    sum_over_vintages = reduced_df.sum(axis=0)
+    diff_vintages, vintages_passed = _compare_with_tolerance(
+        expected_sum_over_vintages, sum_over_vintages, atol, rtol
+    )
+
+    # Compare marginal totals to the grand total
+    diff_marginals, marginals_passed = _compare_with_tolerance(
+        pd.Series([expected_total] * len(marginal_totals)),
+        marginal_totals,
+        atol,
+        rtol,
+    )
+
+    # marginal match - check if marginal sums match, independently of expected total value
+    marginals_match = np.isclose(
+        expected_sum_over_types.sum(),
+        expected_sum_over_vintages.sum(),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    # all passed?
+    all_passed = (
+        True
+        if (
+            all(marginals_passed)  # marginals are the same as total
+            and all(vintages_passed)  # summing rows agrees with '1608-2025'
+            and all(types_passed)  # summing cols agrees with 'total'
+        )
+        else False
+    )
+
+    # logging
+    if all_passed:
+        logger.info(
+            "Marginal check passed: all checks within tolerance (atol=%s, rtol=%s).",
+            atol,
+            rtol,
+        )
+    else:
+        if not all(types_passed):
+            logger.warning(
+                "Type totals differ from row sums. Max diff: %s", diff_types.abs().max()
+            )  # FIXME review log to improve usefulness
+        if not all(vintages_passed):
+            logger.warning(
+                "Vintage totals differ from column sums. Max diff: %s",
+                diff_vintages.abs().max(),
+            )  # FIXME review log to improve usefulness
+        if not all(marginals_passed):
+            logger.warning(
+                "Marginal totals differ from grand total. Marginals: %s, Expected: %s",
+                marginal_totals.to_dict(),
+                expected_total,
+            )  # FIXME review log to improve usefulness
+        if not bool(marginals_match):
+            logger.warning(
+                "Sum over types (%s) != sum over vintages (%s).",
+                expected_sum_over_types.sum(),
+                expected_sum_over_vintages.sum(),
             )
-        else:
-            if sums_match:
-                logger.warning(
-                    f"Marginal check failed: component sums match {sum_by_type['component_sum']}, but differ from total {sum_by_type['total']}. Check dataset for errors."
-                )
-                # TODO return all_passed True here?
-            else:
-                logger.warning(
-                    f"Marginal check failed: component sums don't match type_passed={type_passed}, "
-                    f"vintage_passed={vintage_passed}, sums_match={sums_match}, "
-                    f"difference={difference}"
-                )
-    except KeyError as err:
-        logger.error(f"Error checking marginals: {err}")
-        return False, {"error": str(err)}
 
-    return all_passed, results
+    return MarginalCheckResult(
+        diff_types=diff_types,
+        types_passed=types_passed,
+        diff_vintages=diff_vintages,
+        vintages_passed=vintages_passed,
+        marginal_totals=marginal_totals,
+        marginals_passed=marginals_passed,
+        diff_marginals=diff_marginals,
+        nan_count=nan_count,
+        nan_loc=nan_loc,
+        marginals_match=marginals_match,
+        all_passed=all_passed,
+    )
 
 
 def process_census_dataframe(df, census_year):
@@ -1578,7 +1586,9 @@ def process_census_dataframe(df, census_year):
     df = add_missing_vintages_types(df)
 
     logger.info("Converting census %d data to nullable Int32.", int(census_year))
-    convert_df_to_int(df, inplace=True)
+    convert_num_types(
+        df, inplace=True
+    )  # FIXME this must be undone later on, maybe don't do it here?
 
     logger.info(
         "Filling census %d aggregate types by summing over subtypes",
@@ -1611,7 +1621,19 @@ if __name__ == "__main__":
         year: process_census_dataframe(df, year) for year, df in overwritten.items()
     }
 
-    for census_year in standardized_data:
+    for census_year, df in standardized_data.items():
+        # TODO check series sum and check marginals; perhaps grouped in IPFN procedure?
+        try:
+            logger.info(f"Validating dwelling counts for census {census_year}")
+            convert_num_types(df, dtype="float", inplace=True)
+            results = check_marginals(
+                df.drop("census_year", axis=1),
+            )
+            print(results.diff_types, results.diff_vintages, results.diff_marginals)
+
+        except Exception as err:
+            raise Exception(err)  # FIXME be more specific
+
         display(standardized_data[census_year])
 
     # save as temporary html

@@ -23,8 +23,8 @@ from uncertimety.dataprep import (
     vintage_label_to_tuple,
     calculate_missing_types,
     _validate_frame_preservation,
-    check_series_sum,
     check_marginals,
+    MarginalCheckResult,
 )
 # FIXME: split/rename tests (see, e.g., drop_duplicate_rows)
 # FIXME: add _ to helper functions
@@ -401,9 +401,6 @@ def df_consistent_marginals():
             "other_dwelling": [200, 50, 50, 100],
         }
     )
-
-
-# TODO check for duplication in the pytest fixtures, e.g., df_for_check_sums and df_consistent_marginals. These could be one df, later modified within a given test or class. See, e.g., TestCheckMarginals
 
 
 # === Unit Tests ===
@@ -936,160 +933,77 @@ class TestFramePreservation:
             )
 
 
-class TestCheckSeriesSum:  # FIXME rename _check_sums?
-    def test_exact_match(self, df_for_check_sums):
-        """Test when component values sum exactly to total."""
-        passed, details = check_series_sum(df_for_check_sums, "1608-2025")
-        assert passed
-        assert details["total"] == 1500
-        assert details["component_sum"] == 1500
-        assert details["difference"] == 0
-
-    def test_within_tolerance(self, df_for_check_sums):
-        """Test when sum is within tolerance."""
-        df = df_for_check_sums.copy()
-        df.loc[1, "total"] = 502  # +2
-        df.loc[2, "total"] = 203  # +3
-
-        passed, details = check_series_sum(df, "total", atol=6, rtol=0, axis=1)
-        assert passed
-        assert details["difference"] == -5
-
-        # Test with relative tolerance
-        df.loc[1, "total"] = 490  # -10
-        df.loc[2, "total"] = 203  # +3
-
-        passed, details = check_series_sum(df, "total", atol=0, rtol=0.01, axis=1)
-        assert passed
-        assert details["difference"] == 7
-
-    def test_outside_tolerance(self, df_for_check_sums):
-        """Test when sum is outside tolerance."""
-        df = df_for_check_sums.copy()
-        df.loc[1, "total"] = 510
-
-        passed, details = check_series_sum(df, "total", atol=5, rtol=1e-5, axis=1)
-        assert not passed
-        assert details["difference"] == -10
-
-    def test_wrong_target_axis(self, df_for_check_sums):
-        """Test when target axis is not 0 or 1."""
-        with pytest.raises(KeyError, match="not found in DataFrame"):
-            check_series_sum(df_for_check_sums, "total", axis=0)
-
-    def test_invalid_axis(self, df_for_check_sums):
-        """Test when target axis is not 0 or 1."""
-        with pytest.raises(ValueError, match="Invalid axis"):
-            check_series_sum(df_for_check_sums, "total", axis=3)
-
-
 class TestCheckMarginals:
-    # Fixtures
-    @pytest.fixture
-    def invalid_total_df(self, df_consistent_marginals):
-        """DataFrame with inconsistent total column"""
+    def test_consistent_marginals_all_pass(self, df_consistent_marginals):
+        """All sums match exactly."""
+        result = check_marginals(df_consistent_marginals)
+        assert isinstance(result, MarginalCheckResult)
+        assert all(result.types_passed)
+        assert all(result.vintages_passed)
+        assert all(result.marginals_passed)
+        assert result.marginals_match
+        assert result.all_passed
+        assert result.nan_count == 0
+        assert result.nan_loc == []
+
+    def test_with_nans_counts_and_locations(self, df_for_check_sums):
+        """NaNs are counted and located correctly."""
+        result = check_marginals(df_for_check_sums)
+        assert result.nan_count == 3
+        # Ensure we got coordinates for each NaN
+        assert len(result.nan_loc) == result.nan_count
+        # NaNs should be replaced for calculations
+
+    def test_missing_groupby_raises(self, df_consistent_marginals):
+        with pytest.raises(KeyError, match="Missing groupby column"):
+            check_marginals(df_consistent_marginals.drop(columns=["vintage"]))
+
+    def test_missing_vintage_label_raises(self, df_consistent_marginals):
+        with pytest.raises(KeyError, match="Missing vintage label"):
+            check_marginals(df_consistent_marginals, vintage_label="not-a-vintage")
+
+    def test_missing_type_label_raises(self, df_consistent_marginals):
+        with pytest.raises(KeyError, match="Missing type label"):
+            check_marginals(df_consistent_marginals, type_label="not-a-type")
+
+    def test_type_totals_fail(self, df_consistent_marginals):
+        """Break the sum over types."""
         df = df_consistent_marginals.copy()
-        df.loc[0, "total"] = 1600  # Change total to 100 more than actual component sum
-        return df
+        df.loc[df["vintage"] == "1608-1920", "single_detached"] += 100
+        result = check_marginals(df)
+        assert not all(result.types_passed)
+        assert not result.all_passed
 
-    @pytest.fixture
-    def invalid_component_df(self, df_consistent_marginals):
-        """DataFrame with inconsistent component sum"""
+    def test_vintage_totals_fail(self, df_consistent_marginals):
+        """Break the sum over vintages."""
         df = df_consistent_marginals.copy()
-        df.loc[0, "single_detached"] = (
-            610  # Change to 110 more than actual component sum
-        )
-        return df
+        df.loc[:, "apartment_ge_5"] += 50
+        result = check_marginals(df)
+        assert not all(result.vintages_passed)
+        assert not result.all_passed
 
-    @pytest.fixture
-    def df_with_nans(self, df_consistent_marginals):
-        """DataFrame with NaN values"""
+    def test_marginals_fail(self, df_consistent_marginals):
+        """Break marginal totals without breaking individual row/col sums."""
         df = df_consistent_marginals.copy()
-        df.loc[1, "apartment_ge_5"] = np.nan  # Introduce NaN value
-        return df
+        df.loc[df["vintage"] == "1608-2025", "total"] += 200
+        result = check_marginals(df)
+        assert result.marginals_match
+        assert not all(result.marginals_passed)
+        assert not result.all_passed
 
-    # Tests
-    def test_valid_df(self, df_consistent_marginals):
-        """Test with valid data that should pass"""
-        passed, results = check_marginals(df_consistent_marginals)
-        assert passed
-        assert results["sums_match"]
-        assert np.isclose(results["difference"], 0, atol=0, rtol=1e-5)
-        assert (
-            results["sum_by_type"]["component_sum"]
-            == results["sum_by_vintage"]["component_sum"]
-        )
+    def test_marginals_match_false(self, df_consistent_marginals):
+        """Force marginal sums to differ from each other."""
+        df = df_consistent_marginals.copy()
+        # Reduce one component in totals row so type sum != vintage sum
+        df.loc[df["vintage"] == "1608-1920", "total"] -= 10
+        result = check_marginals(df)
+        assert bool(result.marginals_match) is False
 
-    def test_invalid_total(self, invalid_total_df):
-        """Test with invalid total column"""
-        passed, results = check_marginals(invalid_total_df)
-        assert not passed
-        assert results["sum_by_type"]["total"] == 1600
-        assert results["sum_by_type"]["component_sum"] == 1500
-        assert results["sum_by_vintage"]["component_sum"] == 1500
-
-    # def test_invalid_component_sum(self, invalid_component_df):
-    #     """Test with components not adding up to total"""
-    #     passed, results = check_marginals(invalid_component_df)
-    #     assert passed is False
-    #     assert results['sum_by_type']['component_sum'] == 1600  # 600+800+200
-    #     assert results['sum_by_vintage']['component_sum'] == 1500
-    #     assert results['sums_match'] is False
-    #     assert results['difference'] == 100
-
-    # def test_with_nans(self, df_with_nans):
-    #     """Test handling of NaN values"""
-    #     passed, results = check_marginals(df_with_nans)
-    #     # NaNs are treated as 0, so sums should still match
-    #     assert passed is True
-    #     assert results['sum_by_type']['component_sum'] == 1500
-
-    # def test_within_tolerance(self, valid_df):
-    #     """Test with values just within the tolerance threshold"""
-    #     df = valid_df.copy()
-    #     df.loc[0, 'single_detached'] = 504  # Add 4 to one component (within atol=5)
-    #     passed, results = check_marginals(df, atol=5)
-    #     assert passed is True
-    #     assert abs(results['difference']) <= 5
-
-    # def test_outside_tolerance(self, valid_df):
-    #     """Test with values outside the tolerance threshold"""
-    #     df = valid_df.copy()
-    #     df.loc[0, 'single_detached'] = 506  # Add 6 to one component (outside atol=5)
-    #     passed, results = check_marginals(df, atol=5)
-    #     assert passed is False
-    #     assert abs(results['difference']) > 5
-
-    # def test_missing_column(self):
-    #     """Test with missing column"""
-    #     df = pd.DataFrame({
-    #         'vintage': ['1608-2025', '1608-1920'],
-    #         'some_other_col': [100, 100]
-    #     })
-    #     with pytest.raises(ValueError, match="Columns total or vintage are missing"):
-    #         check_marginals(df)
-
-    # def test_missing_vintage_label(self, valid_df):
-    #     """Test with missing vintage label"""
-    #     df = valid_df.copy()
-    #     df['vintage'] = ['wrong-label', '1608-1920', '1921-1945', '1946-1960']
-    #     with pytest.raises(ValueError, match="Vintage label '1608-2025' not found"):
-    #         check_marginals(df)
-
-    # def test_with_custom_labels(self):
-    #     """Test with custom column and vintage labels"""
-    #     df = pd.DataFrame({
-    #         'cohort': ['total', 'pre-1950', 'post-1950'],
-    #         'dwelling_total': [1000, 600, 400],
-    #         'houses': [500, 300, 200],
-    #         'apartments': [500, 300, 200]
-    #     })
-    #     passed, results = check_marginals(
-    #         df,
-    #         groupby='cohort',
-    #         vintage_label='total',
-    #         type_label='dwelling_total'
-    #     )
-    #     assert passed is True
-    #     assert results['sum_by_type']['component_sum'] == 1000
-    #     assert results['sum_by_vintage']['component_sum'] == 1000
+    def test_tolerance_handling(self, df_consistent_marginals):
+        """Allow small differences within tolerance."""
+        df = df_consistent_marginals.copy()
+        df.loc[df["vintage"] == "1608-1920", "single_detached"] += 1
+        result_strict = check_marginals(df, atol=0.1)  # strict: should fail
+        assert not all(result_strict.types_passed)
+        result_loose = check_marginals(df, atol=5)  # loose: should pass
+        assert all(result_loose.types_passed)
