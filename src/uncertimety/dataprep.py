@@ -113,9 +113,8 @@ def dataprep_main(show_progress: bool = False, single_year: str = None):
     # Check if dir exists
     if not Path("./data/clean").exists():
         Path("./data/clean").mkdir(parents=True, exist_ok=True)
-    fpath = Path("./data/clean/fulldata.html")
 
-    # Save curated dataset
+    # Prepare curated dataset
     dataset = pd.concat(standardized_data).sort_index()
     dataset = filter_relevant_types_vintages(
         dataset,
@@ -127,7 +126,14 @@ def dataprep_main(show_progress: bool = False, single_year: str = None):
     # Save copy for temp tests # FIXME REMOVE
     dataset.to_csv("./data/clean/curated_census_dwelling_stock.csv", index=False)
 
-    tidyfy(dataset).to_html(fpath)
+    # Save curated dataset to html
+    tidy = tidyfy(dataset)
+    fpath = Path("./data/clean/fulldata.html")
+    tidy.to_html(fpath)
+
+    # Save curated dataset as Parquet file with compression
+    fpath = Path("./data/clean/fulldata.parquet")
+    tidy.to_parquet(fpath, compression="snappy", index=False)
 
 
 def tidyfy(df: pd.DataFrame) -> pd.DataFrame:
