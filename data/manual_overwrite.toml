@@ -1,14 +1,17 @@
 # Manual changes to 'fill' the B2020 data
 # -1 is used as a None / Null value, which doesn't exist in TOML
+# FIXME pass columns (e.g., 'total', 'row') as dicts so it's easier to read?
 
 # === Upgrades for the available census years ===
 # ['1961', '1971', '1986', '1991', '1996', '2006', '2011', '2016', '2021']
 
 [1961] # TODO validate how to best fix the 'total' only, keeping other values the same?
-# When we sum over vintages and types, both results lead to the exact same value, 1191368, which is 7000 fewer than the original 1198368 in the dataset. This might be an accounting or printing error in the 1961 census. Here, we adjust the total value to the sum of its components.
-# total = [1191368, 357568, 301937, 517929, 13934, -1,] # for vintages, based on split
-# # 1971 - no changes
-# # 1986 - no changes
+# When we sum over vintages and types, both results lead to the exact same value, 1191368, which is 7000 fewer than the original 1198368 in the dataset. This is likely an accounting or printing error in the 1961 census files from B20/20. The actual value is the calculated one (cf. 1961935291963engfra.pdf). Here, we adjust the total value to the sum of its components.
+total = [1191368, -1, 357568, 301937, -1,  484486, 47377,] # fourth index left as nan so it's calculated by dataprep
+
+# 1971 - no changes
+
+# 1986 - no changes. 1986 is a particular census year; all the data is there, however some subcategories cannot be computed (e.g., apartments, single_attached) due to the data provided. 
 
 [1991] # missing values filled from CHASS; note potential errors
 # I was able to find the remaining detailed columns through CHASS data for type, but some values are slightly different. I only added the missing values, but did not update or modify the values from B2020.
@@ -21,9 +24,10 @@ semi_detached = [116250, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 
 [1996] # missing values filled from CHASS; note potential errors
 # Similarly to 1991, I found the remaining type totals in CHASS data
+# duplex 144775 -> 171_265, found the error from CHASS data
 other_single_attached = [16405, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 apartment_lt_5 = [994850, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
-apartment_duplex = [144775, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+apartment_duplex = [171265, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 row = [72340, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 semi_detached = [130435, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 
@@ -64,4 +68,3 @@ apartment_ge_5 = [154455, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 apartment_lt_5 = [1027900, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 other_single_attached = [19210, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
 mobile = [21645, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
-

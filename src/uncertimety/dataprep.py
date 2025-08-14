@@ -21,7 +21,6 @@ import itertools
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from ipfn import ipfn
 from math import isclose
 from typing import Optional, Dict, List, Tuple, Union, Iterable, Any
 from pandas import testing as tm
@@ -29,7 +28,7 @@ from dataclasses import dataclass
 from uncertimety.logger import init_logger
 from uncertimety.config_loader import load_config
 from uncertimety.random_control import auto_seed_from_config, PY_RANDOM, NP_RANDOM
-from IPython.display import display  # FIXME only for temp test
+from IPython.display import display  # FIXME only for dev and tests
 from datetime import datetime
 from dateutil import relativedelta
 
@@ -41,6 +40,135 @@ if not CONFIG.exists():
     msg = f"No TOML file found at: {CONFIG}"
     logger.error(msg)
     raise FileNotFoundError(msg)
+
+
+def dataprep_main(show_progress: bool = False, single_year: str = None):
+    """Main function for data preparation.
+
+    This function orchestrates the entire data preparation workflow, including
+    loading configurations, importing datasets, and applying transformations.
+
+    It only runs when executing dataprep.py directly. It is meant for development and test purposes.
+
+    Raises:
+        Exception: _description_
+    """
+    # Set program-level rng seed
+    auto_seed_from_config()
+
+    # Example usage
+    print(NP_RANDOM.normal(0, 1))
+
+    replacements = config["census"]["type_map"]
+
+    census_dw = import_census_dataset(replacements=replacements)
+
+    overwritten = overwrite_census_dataset(census_dw)
+
+    if single_year:
+        standardized_data = {
+            year: process_census_dataframe(
+                df,
+                year,
+                keep_other_cols=True,
+                exclude=["other_attached_dwelling"],
+                show_progress=show_progress,
+            )
+            for year, df in sorted(overwritten.items())
+            if str(year) == single_year
+        }
+    else:
+        standardized_data = {
+            year: process_census_dataframe(
+                df,
+                year,
+                keep_other_cols=True,
+                exclude=["other_attached_dwelling"],
+                show_progress=show_progress,
+            )
+            for year, df in sorted(overwritten.items())
+        }
+
+    for census_year, df in sorted(standardized_data.items()):
+        # TODO check series sum and check marginals; perhaps grouped in IPFN procedure?
+        try:
+            logger.info(f"Validating dwelling counts for census {census_year}")
+            convert_num_types(df, dtype="float", inplace=True)
+            results = check_marginals(
+                df.drop("census_year", axis=1),
+                target_types=TARGET_TYPES[1:],
+                atol=10,
+                rtol=2e-4,
+            )  # NOTE atol+rtol = a tolerance of 10/1000, 12/10_000, 30/100_000, 210/1_000_000
+            print(
+                results.marginal_totals, results.marginals_match, results.diff_marginals
+            )
+
+        except Exception as err:
+            raise Exception(err)  # FIXME be more specific
+
+        display(standardized_data[census_year])
+
+    # Create path, save contents as html for reviewing
+    # Check if dir exists
+    if not Path("./data/clean").exists():
+        Path("./data/clean").mkdir(parents=True, exist_ok=True)
+    fpath = Path("./data/clean/fulldata.html")
+
+    # Save curated dataset
+    dataset = pd.concat(standardized_data).sort_index()
+    dataset = filter_relevant_types_vintages(
+        dataset,
+        keep_other_cols=True,
+        meta_cols=["census_year", "vintage"],
+        exclude=["source", "split"],
+    )
+
+    # Save copy for temp tests # FIXME REMOVE
+    dataset.to_csv("./data/clean/curated_census_dwelling_stock.csv", index=False)
+
+    tidyfy(dataset).to_html(fpath)
+
+
+def tidyfy(df: pd.DataFrame) -> pd.DataFrame:
+    """Transforms wide-format dwelling data into tidy (long) format.
+
+    Converts a wide-format DataFrame with separate columns for dwelling types into a
+    long-format DataFrame where each row represents a single observation with
+    census year, vintage, dwelling type, and count.
+
+    Args:
+        df: A DataFrame containing dwelling data in wide format. Must have
+            'census_year' and 'vintage' columns, with dwelling types as separate columns.
+
+    Returns:
+        A tidy (long-format) DataFrame with columns:
+            - census_year (int): The census year
+            - vintage (str): The vintage label (construction period)
+            - type (str): The dwelling type
+            - dwellings (float): The number of dwellings
+
+    Examples:
+        >>> wide_df = pd.DataFrame({
+        ...     'census_year': [2001, 2001],
+        ...     'vintage': ['1608-2025', '1608-1920'],
+        ...     'total': [2978115, 450225],
+        ...     'single_detached': [1371005, np.nan]
+        ... })
+        >>> tidyfy(wide_df).head(2)
+           census_year    vintage            type   dwellings
+        0         2001  1608-2025           total  2978115.0
+        1         2001  1608-1920           total   450225.0
+    """
+    tidy = (
+        df.reset_index(drop=True)
+        .set_index(["census_year", "vintage"])
+        .stack(level=0, future_stack=True)
+        .reset_index()
+        .rename(columns={"level_2": "type", 0: "dwellings"})
+        .astype({"census_year": int, "vintage": str, "type": str, "dwellings": float})
+    )
+    return tidy
 
 
 def load_dataset_config(config_path: Path) -> Dict:
@@ -394,6 +522,7 @@ def overwrite_census_dataset(
         if year in dataframes:
             logger.info(f"Overwriting existing DataFrame for year {year}")
             apply_overwrites(dataframes[year], instructions, year)
+
         else:
             logger.info(f"Creating new DataFrame for year {year}")
             try:
@@ -902,7 +1031,6 @@ def _find_compatible_vintages(df, vintage: str, sep="-"):
         msg = f"Failed to parse vintage '{vintage}' for compatibility check: {err}. Consider running harmonize_vintage_label on dataframe first."
         logger.error(msg)
         raise ValueError(msg) from err
-
 
     # Get the intersection
     target_indices = non_nans.index.intersection(compatible.index)
@@ -1705,109 +1833,15 @@ def process_census_dataframe(
 
 
 if __name__ == "__main__":
-    # Set program-level rng seed
-    auto_seed_from_config()
-
-    # Example usage
-    print(NP_RANDOM.normal(0, 1))
-
-    replacements = config["census"]["type_map"]
-
-    census_dw = import_census_dataset(replacements=replacements)
-
-    overwritten = overwrite_census_dataset(census_dw)
-
-    standardized_data = {
-        year: process_census_dataframe(
-            df,
-            year,
-            keep_other_cols=True,
-            exclude=["other_attached_dwelling"],
-            show_progress=False,
-        )
-        for year, df in sorted(overwritten.items())
-        # if str(year) == "1961"
-    }
-
-    for census_year, df in sorted(standardized_data.items()):
-        # TODO check series sum and check marginals; perhaps grouped in IPFN procedure?
-        try:
-            logger.info(f"Validating dwelling counts for census {census_year}")
-            convert_num_types(df, dtype="float", inplace=True)
-            results = check_marginals(
-                df.drop("census_year", axis=1),
-                target_types=TARGET_TYPES[1:],
-                atol=10,
-                rtol=2e-4,
-            )  # NOTE atol+rtol = a tolerance of 10/1000, 12/10_000, 30/100_000, 210/1_000_000
-            print(
-                results.marginal_totals, results.marginals_match, results.diff_marginals
-            )
-
-        except Exception as err:
-            raise Exception(err)  # FIXME be more specific
-
-        display(standardized_data[census_year])
-
-    # save as temporary html
-    dataset = pd.concat(standardized_data).sort_index()
-    dataset = filter_relevant_types_vintages(
-        dataset, meta_cols=["census_year", "vintage"]
+    dataprep_main(
+        # single_year='1961',
+        # show_progress=False,
     )
-    dataset.to_html("./temp.html")
-
-    # TODO: standardize the dataset AFTER the IPFN procedure, as we need 'all' dwellings to be balanced. Therefore, I need to treat the other_dwelling / other_attached dwelling for consistency.
 
 # TODO Refactor this file as a module, and separate the functions into different .py files (i.e., separation of concerns). Check for DRY and code smells.
 
 # FIXME change all references to atol and rtol to values from config file?
 
-# TODO Reprendre à "redefine target cohorts" in dmfa_dataprep.ipynb, AND Check_sums - also have a look at round_consistent_sum, fix_marginals, and res_fix
+# TODO compare to dwellings 1685-2021.csv after interpolation/ ipfn?
 
-
-# TODO compare to dwellings 1685-2021.csv ?
-
-# TODO: look at def check_sums in the ipynb files; it seems to be the start of the IPFN procedure. Then, in interpolating the missing data, I discuss padding backwards. however, why not set zeros to known values, then interpolate linearly, but backwards?
-# IMPORTANTLY : "The 'masks' saved here will be useful to identify: 1 - which census have interpolated data (which previously had nans), 2 - what data was known before the interpolation, to prevent the IPFN of modifying these values" I'll want to keep the Nans and relevant totals (as marginals) for the IPFN procedure. "
-# TODO round_consistent_sum
-# TODO fix_marginals
-# TODO: look at the 'corrected' values below, and at everything with "_fix" suffix
-# TODO: compare with the exported dataset to see if I get the same results
-
-# TODO, CHECK these values e.g., in manual overwrites. there are expected issues (in check_sums) for:
-"""
-# 1961
-# Fix 1961 total
-# Sums over cohorts and types both lead to the same value for total, when all other sums agree; where are the missing 7_000?
-csdw_c["1961"].loc[0, "total"] = 1191368.0
-
-# 1986
-# cohorts are close (~175), types is wrong by 1M because of the undefined single attached and apartment types. When summing over all available types, the results are fine.
-# NOTE Using CHASS data breaks the individual type sums (by cohorts)
-# csdw_c['1986'].loc[0,'total'] = 2_357_100
-# csdw_c['1986'].loc[0,'single_detached'] = 1_032_600
-# csdw_c['1986'].loc[0,'apartment>5'] = 116_120
-# csdw_c['1986'].loc[0,'mobile'] = 16_950
-# csdw_c['1986'].loc[0,'other_attached_dwelling'] = 1_191_440
-# csdw_c['1986'].drop(2).iloc[1:,2].sum()
-
-# 1991
-# cohorts are fine, types are close (~390)
-csdw_c["1991"].loc[0, "single_detached"] = 1_175_085  # CHASS data; found the mistake
-csdw_c["1991"].loc[0, "apartment>5"] = 137_105  # CHASS data; found the mistake
-csdw_c["1991"].loc[0, "mobile"] = 24_720  # CHASS data; found the mistake
-csdw_c["1991"].loc[0, "apartments"] = (
-    csdw_c["1991"].loc[0, combined_types["apartments"]].sum()
-)
-# csdw_c['1991'].drop(2).iloc[1:,2].sum()
-
-# 1996
-# cohorts are fine, types need fixing
-csdw_c["1996"].loc[0, "apartment_duplex"] = 171_265  # CHASS data; found the mistake
-csdw_c["1996"].loc[0, "apartments"] = (
-    csdw_c["1996"].loc[0, combined_types["apartments"]].sum()
-)
-# csdw_c['1996'].drop(2).iloc[1:,2].sum()
-
-"""
 # TODO et, plus tard, "# Autres ajouts manuels, à réviser # FIXME"

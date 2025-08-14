@@ -420,33 +420,36 @@ class TestNormalizeVintageLabel:
             ("1996(1)", "1996-1"),
             ("1961-1971(1)", "1961-1971-1"),
             ("2011 to 2015", "2011-2015"),
-            ("1960 - 1961 (1)", "1960-1961-1")
+            ("1960 - 1961 (1)", "1960-1961-1"),
         ]
         # TODO test with other sep values
         for raw, expected in cases:
             assert normalize_vintage_label(raw) == expected
+
 
 class HarmonizeVintageLabels:
     def test_harmonize_vintage_labels(self, df_1991):
         df = harmonize_vintage_labels(
             df=df_1991,
         )
-        vintages = df['vintage'].unique().to_list()
+        vintages = df["vintage"].unique().to_list()
 
-        assert Counter(vintages) == Counter([
-            "1608-2025",
-            "1608-1945",
-            "1608-1920",
-            "1921-1945",
-            "1946-1970",
-            "1946-1960",
-            "1961-1970",
-            "1971-1985",
-            "1971-1980",
-            "1981-1985",
-            "1986-1991",
-            "1991-1995",
-        ])
+        assert Counter(vintages) == Counter(
+            [
+                "1608-2025",
+                "1608-1945",
+                "1608-1920",
+                "1921-1945",
+                "1946-1970",
+                "1946-1960",
+                "1961-1970",
+                "1971-1985",
+                "1971-1980",
+                "1981-1985",
+                "1986-1991",
+                "1991-1995",
+            ]
+        )
 
 
 class TestCleanVintage:
@@ -790,7 +793,21 @@ class TestAddMissingVintagesTypes:
         self, df_1991, historic_vintages, total_dwelling_types, tmp_path
     ):
         # Overwrite the vintage column with harmonized values
-        df_1991['vintage'] = ["1608-2025", "1608-1945", "1608-1920", "1921-1945", "1946-1970", "1946-1960", "1961-1970", "1971-1985", "1971-1980", "1981-1985", "1986-1990", "1986-1990", "1991-1995",]
+        df_1991["vintage"] = [
+            "1608-2025",
+            "1608-1945",
+            "1608-1920",
+            "1921-1945",
+            "1946-1970",
+            "1946-1960",
+            "1961-1970",
+            "1971-1985",
+            "1971-1980",
+            "1981-1985",
+            "1986-1990",
+            "1986-1990",
+            "1991-1995",
+        ]
 
         # Setup
         result = add_missing_vintages_types(
@@ -963,7 +980,11 @@ class TestFramePreservation:
 class TestCheckMarginals:
     def test_consistent_marginals_all_pass(self, df_consistent_marginals):
         """All sums match exactly."""
-        target_types = [col for col in df_consistent_marginals.columns if col not in ['total','vintage']]
+        target_types = [
+            col
+            for col in df_consistent_marginals.columns
+            if col not in ["total", "vintage"]
+        ]
         result = check_marginals(df_consistent_marginals, target_types=target_types)
         assert isinstance(result, MarginalCheckResult)
         assert all(result.types_passed)
@@ -976,7 +997,9 @@ class TestCheckMarginals:
 
     def test_with_nans_counts_and_locations(self, df_for_check_sums):
         """NaNs are counted and located correctly."""
-        target_types = [col for col in df_for_check_sums.columns if col not in ['total','vintage']]
+        target_types = [
+            col for col in df_for_check_sums.columns if col not in ["total", "vintage"]
+        ]
         result = check_marginals(df_for_check_sums, target_types=target_types)
         assert result.nan_count == 3
         # Ensure we got coordinates for each NaN
@@ -999,7 +1022,7 @@ class TestCheckMarginals:
         """Break the sum over types."""
         df = df_consistent_marginals.copy()
         df.loc[df["vintage"] == "1608-1920", "single_detached"] += 100
-        target_types = [col for col in df.columns if col not in ['total','vintage']]
+        target_types = [col for col in df.columns if col not in ["total", "vintage"]]
         result = check_marginals(df, target_types=target_types)
         assert not all(result.types_passed)
         assert not result.all_passed
@@ -1008,7 +1031,7 @@ class TestCheckMarginals:
         """Break the sum over vintages."""
         df = df_consistent_marginals.copy()
         df.loc[:, "apartment_ge_5"] += 50
-        target_types = [col for col in df.columns if col not in ['total','vintage']]
+        target_types = [col for col in df.columns if col not in ["total", "vintage"]]
         result = check_marginals(df, target_types=target_types)
         assert not all(result.vintages_passed)
         assert not result.all_passed
@@ -1017,7 +1040,7 @@ class TestCheckMarginals:
         """Break marginal totals without breaking individual row/col sums."""
         df = df_consistent_marginals.copy()
         df.loc[df["vintage"] == "1608-2025", "total"] += 200
-        target_types = [col for col in df.columns if col not in ['total','vintage']]
+        target_types = [col for col in df.columns if col not in ["total", "vintage"]]
         result = check_marginals(df, target_types=target_types)
         assert result.marginals_match
         assert not all(result.marginals_passed)
@@ -1028,7 +1051,7 @@ class TestCheckMarginals:
         df = df_consistent_marginals.copy()
         # Reduce one component in totals row so type sum != vintage sum
         df.loc[df["vintage"] == "1608-1920", "total"] -= 10
-        target_types = [col for col in df.columns if col not in ['total','vintage']]
+        target_types = [col for col in df.columns if col not in ["total", "vintage"]]
         result = check_marginals(df, target_types=target_types)
         assert bool(result.marginals_match) is False
 
@@ -1036,99 +1059,94 @@ class TestCheckMarginals:
         """Allow small differences within tolerance."""
         df = df_consistent_marginals.copy()
         df.loc[df["vintage"] == "1608-1920", "single_detached"] += 1
-        target_types = [col for col in df.columns if col not in ['total','vintage']]
-        result_strict = check_marginals(df, atol=0.1, target_types=target_types)  # strict: should fail
+        target_types = [col for col in df.columns if col not in ["total", "vintage"]]
+        result_strict = check_marginals(
+            df, atol=0.1, target_types=target_types
+        )  # strict: should fail
         assert not all(result_strict.types_passed)
-        result_loose = check_marginals(df, atol=5, target_types=target_types)  # loose: should pass
+        result_loose = check_marginals(
+            df, atol=5, target_types=target_types
+        )  # loose: should pass
         assert all(result_loose.types_passed)
+
 
 class TestFindCompatibleVintages:
     @pytest.fixture
     def test_df(self):
-        return pd.DataFrame({
-            'vintage': ['1608-2025', '1608-1920', '1921-1945', '1946-1960', '1961-1970', '1971-1980'],
-            'total': [1500, 500, 200, 800, 700, 600],
-            'single_detached': [500, 300, 192, 8, 350, 400],
-            'other_attached_dwelling': [800, np.nan, 8, 792, 350, np.nan],
-            'other_dwelling': [200, np.nan, np.nan, 0, np.nan, 200]
-        })
+        return pd.DataFrame(
+            {
+                "vintage": [
+                    "1608-2025",
+                    "1608-1920",
+                    "1921-1945",
+                    "1946-1960",
+                    "1961-1970",
+                    "1971-1980",
+                ],
+                "total": [1500, 500, 200, 800, 700, 600],
+                "single_detached": [500, 300, 192, 8, 350, 400],
+                "other_attached_dwelling": [800, np.nan, 8, 792, 350, np.nan],
+                "other_dwelling": [200, np.nan, np.nan, 0, np.nan, 200],
+            }
+        )
 
     def test_basic_compatibility(self, test_df):
         """Test basic compatibility within a range"""
-        compatible = _find_compatible_vintages(test_df, '1920-1960')
+        compatible = _find_compatible_vintages(test_df, "1920-1960")
         # Should match vintages 1921-1945 and 1946-1960
-        vintages = compatible['vintage'].to_list()
+        vintages = compatible["vintage"].to_list()
         assert len(vintages) == 2
-        assert '1921-1945' in vintages
-        assert '1946-1960' in vintages
-    
+        assert "1921-1945" in vintages
+        assert "1946-1960" in vintages
+
     def test_exact_vintage_match(self, test_df):
         """Test finding an exact vintage"""
-        compatible = _find_compatible_vintages(test_df, '1946-1960')
+        compatible = _find_compatible_vintages(test_df, "1946-1960")
         # Should match vintage 1946-1960 exactly
-        vintages = compatible['vintage'].to_list()
+        vintages = compatible["vintage"].to_list()
         assert len(vintages) == 1
-        assert '1946-1960' in vintages
-    
+        assert "1946-1960" in vintages
+
     def test_no_matches(self, test_df):
         """Test when no vintages match the range"""
-        compatible = _find_compatible_vintages(test_df, '2000-2020')
-        # No vintages match this range (excluding 1608-2025 which is not considered)
+        compatible = _find_compatible_vintages(test_df, "2000-2020")
+        # No vintages match this range
         assert len(compatible) == 0
 
     def test_overlapping_vintages(self, test_df):
         """Test vintages that partially overlap with the range"""
-        compatible = _find_compatible_vintages(test_df, '1940-1965')
-        # Should match 1921-1945, 1946-1960, 1961-1970
-        vintages = compatible['vintage'].to_list()
+        compatible = _find_compatible_vintages(test_df, "1940-1965")
+        # Should match only 1946-1960, and not e.g., 1921-1945 and 1961-1970
+        vintages = compatible["vintage"].to_list()
         assert len(vintages) == 1
-        assert '1946-1960' in vintages
-    
-#     def test_with_all_nan_rows(self):
-#         """Test with rows that contain only NaN values"""
-#         df = pd.DataFrame({
-#             'vintage': ['1608-2025', '1608-1920', '1921-1945', '1946-1960'],
-#             'total': [1500, np.nan, np.nan, 800],
-#             'single_detached': [500, np.nan, np.nan, 8],
-#             'other_dwelling': [200, np.nan, np.nan, 0]
-#         })
-        
-#         # Since the rows for 1608-1920 and 1921-1945 have all NaNs,
-#         # they should not be included in compatible vintages
-#         indices = _find_compatible_vintages(df, '1900-1950')
-#         assert len(indices) == 0
-    
-#     def test_with_total_row_excluded(self, test_df):
-#         """Test that the total row (1608-2025) is excluded from results"""
-#         indices = _find_compatible_vintages(test_df, '1600-2025')
-#         # Should not include the total vintage
-#         vintages = test_df.loc[indices, 'vintage'].tolist()
-#         assert '1608-2025' not in vintages
-#         assert len(vintages) == 5  # All other vintages
-    
-#     def test_with_whitespace(self, test_df):
-#         """Test handling of whitespace in the input vintage"""
-#         indices = _find_compatible_vintages(test_df, ' 1946-1960 ')
-#         vintages = test_df.loc[indices, 'vintage'].tolist()
-#         assert len(vintages) == 1
-#         assert '1946-1960' in vintages
-    
-#     def test_with_custom_separator(self):
-#         """Test with a custom separator"""
-#         df = pd.DataFrame({
-#             'vintage': ['1608_2025', '1608_1920', '1921_1945', '1946_1960'],
-#             'total': [1500, 500, 200, 800],
-#         })
-        
-#         indices = _find_compatible_vintages(df, '1920_1950', sep='_')
-#         vintages = df.loc[indices, 'vintage'].tolist()
-#         assert len(vintages) == 1
-#         assert '1921_1945' in vintages
-    
-#     def test_invalid_vintage_format(self, test_df):
-#         """Test handling of invalid vintage format"""
-#         with pytest.raises(ValueError):
-#             _find_compatible_vintages(test_df, 'invalid-format')
-        
-#         with pytest.raises(ValueError):
-#             _find_compatible_vintages(test_df, '1950')  # Missing separator
+        assert "1946-1960" in vintages
+
+    def test_with_all_nan_rows(self):
+        """Test with rows that contain only NaN values"""
+        df = pd.DataFrame(
+            {
+                "vintage": ["1608-2025", "1608-1920", "1921-1945", "1946-1960"],
+                "total": [1500, np.nan, np.nan, 800],
+                "single_detached": [500, np.nan, np.nan, 8],
+                "other_dwelling": [200, np.nan, np.nan, 0],
+            }
+        )
+        # Since the rows for 1608-1920 and 1921-1945 have all NaNs,
+        # they should not be included in compatible vintages
+        indices = _find_compatible_vintages(df, "1900-1950")
+        assert len(indices) == 0
+
+    def test_with_whitespace(self, test_df):
+        """Test handling of whitespace in the input vintage"""
+        indices = _find_compatible_vintages(test_df, " 1946-1960 ")
+        vintages = test_df.loc[indices, "vintage"].tolist()
+        assert len(vintages) == 1
+        assert "1946-1960" in vintages
+
+    def test_invalid_vintage_format(self, test_df):
+        """Test handling of invalid vintage format"""
+        with pytest.raises(ValueError):
+            _find_compatible_vintages(test_df, "invalid-format")
+
+        with pytest.raises(ValueError):
+            _find_compatible_vintages(test_df, "1950")  # Missing separator
