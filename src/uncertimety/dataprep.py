@@ -21,6 +21,7 @@ import itertools
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from ipfn import ipfn
 from math import isclose
 from typing import Optional, Dict, List, Tuple, Union, Iterable, Any
 from pandas import testing as tm
@@ -235,7 +236,6 @@ def import_census_dataset(
 
         # Clean and rename columns
         original_cols = df.columns.to_list()
-        print(original_cols)  # FIXME, temp crutch
         # FIXME - validate how other_movable is treated, as it is now
         # aggregated with mobile, however, mobile != other_movable - this
         # overestimates the number of mobile dwellings. however, this should have little to no impacts for the purposes of this research given the low number of mobile dwellings
@@ -347,14 +347,16 @@ def patch_vintage_and_trim(df, instructions):
     Modifies the 'vintage' column and trims rows if specified in instructions.
     """
     # TODO unit tests
-    patch = instructions.get("vintage_patch")
+    patches = instructions.get("vintage_patch")
     drop_from = instructions.get("drop_rows_starting_at")
 
-    if patch:
+    if patches:
         try:
-            row = int(patch["row"])
-            df.at[row, "vintage"] = patch["value"]
-            df.at[row, "census_year"] = patch["census_year"]
+            for patch in patches:
+                logger.info(f"Applying vintage patch: {patch}")
+                row = int(patch["row"])
+                df.at[row, "vintage"] = patch["value"]
+                df.at[row, "census_year"] = patch["census_year"]
         except Exception as err:
             logger.warning(f"Could not patch vintage: {err}")
 
@@ -396,7 +398,9 @@ def overwrite_census_dataset(
             logger.info(f"Creating new DataFrame for year {year}")
             try:
                 ref_year = str(instructions["create_from"])
-                base_df = dataframes[ref_year].iloc[:, :2].copy()
+                base_df = (
+                    dataframes[ref_year].iloc[:, :2].copy()
+                )  # take census_year and 'vintage' cols
                 base_df["census_year"] = str(year)
                 dataframes[year] = base_df
             except KeyError:
@@ -879,13 +883,40 @@ def _validate_data_preservation(
         raise ValueError(msg) from err
 
 
+def _find_compatible_vintages(df, vintage: str, sep="-"):
+    if type(vintage) is not str:
+        raise ValueError("Vintage must be a string")
+
+    # Find non-empty rows
+    non_nans = df.loc[(df.notna().any(axis=1))]
+
+    # Find compatible vintages
+    start, end = [int(years) for years in vintage.strip().split(sep)]
+
+    try:
+        compatible = df.loc[
+            (df["vintage"].apply(lambda x: int(x.split(sep)[0])) >= start)
+            & (df["vintage"].apply(lambda x: int(x.split(sep)[1])) <= end)
+        ]  # Note this only works for properly formatted vintage labels; passing unformatted labels, e.g., 'le-1945', breaks the int() call and throws a valueerror
+    except ValueError as err:
+        msg = f"Failed to parse vintage '{vintage}' for compatibility check: {err}. Consider running harmonize_vintage_label on dataframe first."
+        logger.error(msg)
+        raise ValueError(msg) from err
+
+
+    # Get the intersection
+    target_indices = non_nans.index.intersection(compatible.index)
+
+    return df.loc[target_indices]
+
+
 def add_missing_vintages_types(
     dataframe: pd.DataFrame,
     target_vintages: Optional[List[str]] = None,
     target_types: Optional[List[str]] = None,
     config_dir=CONFIG,
     sep: str = "-",
-    meta_cols=["census_year", "vintage", "source", "split"],
+    meta_cols=META_COLS,
 ) -> pd.DataFrame:
     """
     Ensures the dataframe contains all expected dwelling types and vintages.
@@ -941,8 +972,9 @@ def add_missing_vintages_types(
     # Add missing vintages
     new_rows = []
     for missing_vintage in sorted(
-        missing_vintages
-    ):  # FIXME sorted(a, key=lambda student: student[1])
+        missing_vintages,
+        key=lambda x: int(x.split(sep)[0]),  # sort by start year
+    ):  # FIXME use same functionality as sort_vintage_labels?
         try:
             start, end = [check_year(year) for year in missing_vintage.split(sep)]
         except Exception as err:
@@ -954,7 +986,10 @@ def add_missing_vintages_types(
         if start > census_year:
             values = {dwellings: 0 for dwellings in target_types}
         else:
-            values = {dwellings: np.nan for dwellings in target_types}
+            # if there are existing vintages with at least one non-nan value, then values should be the sum
+            values = {
+                dwellings: np.nan for dwellings in target_types
+            }  # FIXME here, target_types is the total dwelling types list (all); update name?
 
         new_row = {
             "census_year": census_year,
@@ -966,6 +1001,30 @@ def add_missing_vintages_types(
     if new_rows:
         new_df = pd.DataFrame(new_rows)
         dataframe = pd.concat([dataframe, new_df], ignore_index=True, sort=False)
+
+    # ==== Fill nans
+    # Look through ALL completely empty vintages and fill nans using compatible vintages
+    dropped_cols = [col for col in META_COLS if col in dataframe.columns]
+    nan_rows = dataframe.drop(dropped_cols, axis=1).isna().all(axis=1)
+    nan_vintages = dataframe.loc[nan_rows, "vintage"].unique().tolist()
+    logger.info(f"Filling NaNs for vintages: {nan_vintages}")
+
+    for vintage in sorted(nan_vintages):
+        compatible = _find_compatible_vintages(dataframe, vintage)
+        if len(compatible) > 0:
+            numeric_cols = [col for col in dataframe.columns if col not in META_COLS]
+            logger.info(
+                f"Found compatible vintages for {vintage}: {compatible['vintage'].to_list()}"
+            )
+            dataframe.loc[dataframe["vintage"] == vintage, numeric_cols] = (
+                compatible[numeric_cols].sum(skipna=True, min_count=1).values
+            )
+
+            # values.update(
+            #     compatible.drop(columns=dropped_cols).sum(min_count=1).to_dict()
+            # )  # NOTE: previously skipna=False. Using skipna, if there are nans in the compatible columns, then the sum will be nan. It might be better to use the partial sum of known values as a 'min' reference, knowing that the IPFN uses weights down the line. Then these values would be weighted as having at least 'min', not zero. Here, min_count=1 ensures the sum will be made if 1 or more values are not nans.
+        else:
+            logger.info(f"No compatible vintages found for {vintage}")
 
     # ==== Fix column order
     data_cols = dataframe.columns.difference(meta_cols)
@@ -981,7 +1040,7 @@ def harmonize_vintage_labels(
     sep: str = "-",
     model_start=1608,
     last_census=2021,
-    meta_cols=["census_year", "vintage", "source", "split"],
+    meta_cols=META_COLS,
     round_last_vintage=True,
 ) -> pd.DataFrame:
     """
@@ -1101,7 +1160,7 @@ def vintage_label_to_tuple(label: str, sep: str = "-") -> Tuple[int, int]:
 def convert_num_types(
     df: pd.DataFrame,
     dtype: str = "Int32",
-    meta_cols: List[str] = ["census_year", "vintage", "source", "split"],
+    meta_cols: List[str] = META_COLS,
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1268,6 +1327,7 @@ def filter_relevant_types_vintages(
     col_order: list[str] | None = None,
     inplace: bool = False,
     keep_other_cols: bool = False,
+    exclude: list[str] = [],
     meta_cols: list[str] = META_COLS,
 ) -> pd.DataFrame:
     """
@@ -1294,7 +1354,9 @@ def filter_relevant_types_vintages(
         col_order = merge_unique_ordered([meta_cols, col_order])
 
     if keep_other_cols:
-        other_cols = [col for col in working_df.columns if col not in col_order]
+        other_cols = [
+            col for col in working_df.columns if col not in (col_order + exclude)
+        ]
     else:
         other_cols = []
 
@@ -1315,6 +1377,8 @@ def standardize_census(
     meta_cols: list[str] = META_COLS[:2],
     merged_cols: list[str] = MERGED_COLS,
     col_order: list[str] | None = None,
+    keep_other_cols: bool = False,
+    exclude: list[str] = [],
 ) -> pd.DataFrame:
     """
     Merge 'other_attached_dwelling' and 'other_dwelling' intelligently,
@@ -1352,7 +1416,8 @@ def standardize_census(
         vintages=vintages,
         col_order=col_order,
         meta_cols=meta_cols,
-        keep_other_cols=False,
+        keep_other_cols=keep_other_cols,
+        exclude=exclude,
     )
 
 
@@ -1378,27 +1443,6 @@ def merge_unique_ordered(*lists: List[Any]) -> List[Any]:
 
     flat = itertools.chain.from_iterable(lists)
     return list(dict.fromkeys(flat))
-
-
-def validate_dwelling_counts(
-    df: pd.DataFrame,
-    inplace: bool = False,
-):
-    working_df = df if inplace else df.copy()
-
-    # TODO reprendre ici; voir ce que j'avais déjà codé précédemment si parties réutilisables.
-
-    # if columns outside target cols or if vintages outside target vintages, then filter_relevant
-
-    # accept a dataframe, filter relevant types and vintages, including other_dwelling
-    # check sums over types; check if the 'total' agrees with the sums, using atol of ~5 (20?) and rtol 1e-5.
-    # check sums over cohorts (0-2025) vs rest
-
-    # check marginals : compare 'total' and '0-2025'
-    # logger.warn any problems
-
-    # IF there are issues, then launch IPFN procedure (?)
-    return working_df
 
 
 @dataclass
@@ -1455,6 +1499,8 @@ def check_marginals(
     type_label: str = "total",
     atol: float = 5,
     rtol: float = 1e-5,
+    meta_cols: list[str] = META_COLS,
+    target_types: list[str] = TARGET_TYPES[1:],  # except total
 ) -> MarginalCheckResult:
     """
     Check if the marginals (total counts) are consistent across vintages and types.
@@ -1469,7 +1515,16 @@ def check_marginals(
     if type_label not in df.columns:
         raise KeyError(f"Missing type label '{type_label}'.")
 
+    target_types = [
+        dw_type
+        for dw_type in target_types
+        if dw_type in df.columns and dw_type not in meta_cols
+    ]
+
+    numeric_cols = [col for col in df.columns if col not in meta_cols]
+
     working_df = df.copy().set_index(groupby)
+    working_df = working_df[numeric_cols]
 
     # Get nan data
     nan_count, nan_loc = _check_nans(working_df)
@@ -1485,15 +1540,17 @@ def check_marginals(
     marginal_totals = pd.Series(
         {
             "expected_sum_over_types": expected_sum_over_types.sum(),
-            "expected_sum_over_vintages": expected_sum_over_vintages.sum(),
+            "expected_sum_over_vintages": expected_sum_over_vintages[
+                target_types
+            ].sum(),  # avoids duplicated type (aggregated and overlapping categories)
         }
     )
 
     # Drop the total row (e.g., '1608-2025') and total column (e.g., 'total') for the actual sums
     reduced_df = working_df.drop(vintage_label).drop(type_label, axis=1)
 
-    # Sum over types (columns), should be equal to 'total'
-    sum_over_types = reduced_df.sum(axis=1)
+    # Sum over target types (columns), should be equal to 'total'
+    sum_over_types = reduced_df.loc[:, target_types].sum(axis=1)
     diff_types, types_passed = _compare_with_tolerance(
         expected_sum_over_types, sum_over_types, atol, rtol
     )
@@ -1506,7 +1563,7 @@ def check_marginals(
 
     # Compare marginal totals to the grand total
     diff_marginals, marginals_passed = _compare_with_tolerance(
-        pd.Series([expected_total] * len(marginal_totals)),
+        [expected_total] * len(marginal_totals),
         marginal_totals,
         atol,
         rtol,
@@ -1515,7 +1572,9 @@ def check_marginals(
     # marginal match - check if marginal sums match, independently of expected total value
     marginals_match = np.isclose(
         expected_sum_over_types.sum(),
-        expected_sum_over_vintages.sum(),
+        expected_sum_over_vintages[
+            target_types
+        ].sum(),  # avoids duplicated type (aggregated and overlapping categories)
         atol=atol,
         rtol=rtol,
     )
@@ -1558,7 +1617,9 @@ def check_marginals(
             logger.warning(
                 "Sum over types (%s) != sum over vintages (%s).",
                 expected_sum_over_types.sum(),
-                expected_sum_over_vintages.sum(),
+                expected_sum_over_vintages[
+                    target_types
+                ].sum(),  # FIXME not DRY, calculate only once
             )
 
     return MarginalCheckResult(
@@ -1576,31 +1637,70 @@ def check_marginals(
     )
 
 
-def process_census_dataframe(df, census_year):
+def sort_vintage_labels(
+    df: pd.DataFrame, vintage_col: str = "vintage", vintage_label: str = "1608-2025"
+) -> pd.DataFrame:
+    """Sort the dataframe by vintage labels."""
+    # First, extract the total row (if present)
+    total_row = df[df[vintage_col] == vintage_label]
+    rest_of_df = df[df[vintage_col] != vintage_label]
+
+    # Define a key function to sort by the first year in the vintage
+    def extract_first_year(vintage_str):
+        try:
+            # Extract the first number from the vintage string
+            first_year = int(vintage_str.strip().split("-")[0])
+            return first_year
+        except (ValueError, IndexError):
+            # For any non-standard format, return a large number to sort it last
+            return 9999
+
+    # Sort the rest of the dataframe by the first year
+    sorted_rest = rest_of_df.sort_values(
+        by=vintage_col, key=lambda x: x.map(extract_first_year)
+    )
+
+    # Combine the total row with the sorted rest
+    if not total_row.empty:
+        result = pd.concat([total_row, sorted_rest], ignore_index=True)
+    else:
+        result = sorted_rest.reset_index(drop=True)
+
+    return result
+
+
+def process_census_dataframe(
+    df,
+    census_year,
+    keep_other_cols: bool = True,
+    exclude: list[str] = [],
+    show_progress: bool = False,
+) -> pd.DataFrame:  # FIXME remove display convenience flag
     """Process a single census dataframe through the full pipeline."""
 
     logger.info("Harmonizing census %d", int(census_year))
     df = harmonize_vintage_labels(df, sep="-", model_start=1608)
-
+    display(df) if show_progress else None
     logger.info("Expanding census %d with missing types and vintages", int(census_year))
     df = add_missing_vintages_types(df)
-
+    display(df) if show_progress else None
     logger.info("Converting census %d data to nullable Int32.", int(census_year))
     convert_num_types(
         df, inplace=True
     )  # FIXME this must be undone later on, maybe don't do it here?
-
+    display(df) if show_progress else None
     logger.info(
         "Filling census %d aggregate types by summing over subtypes",
         int(census_year),
     )
     df = calculate_missing_types(df)
-
+    display(df) if show_progress else None
     logger.info(
         "Extracting relevant subset for census %d",
         int(census_year),
     )
-    df = standardize_census(df)
+    df = standardize_census(df, keep_other_cols=keep_other_cols, exclude=exclude)
+    df = sort_vintage_labels(df)
     return df
 
 
@@ -1618,18 +1718,31 @@ if __name__ == "__main__":
     overwritten = overwrite_census_dataset(census_dw)
 
     standardized_data = {
-        year: process_census_dataframe(df, year) for year, df in overwritten.items()
+        year: process_census_dataframe(
+            df,
+            year,
+            keep_other_cols=True,
+            exclude=["other_attached_dwelling"],
+            show_progress=False,
+        )
+        for year, df in sorted(overwritten.items())
+        # if str(year) == "1961"
     }
 
-    for census_year, df in standardized_data.items():
+    for census_year, df in sorted(standardized_data.items()):
         # TODO check series sum and check marginals; perhaps grouped in IPFN procedure?
         try:
             logger.info(f"Validating dwelling counts for census {census_year}")
             convert_num_types(df, dtype="float", inplace=True)
             results = check_marginals(
                 df.drop("census_year", axis=1),
+                target_types=TARGET_TYPES[1:],
+                atol=10,
+                rtol=2e-4,
+            )  # NOTE atol+rtol = a tolerance of 10/1000, 12/10_000, 30/100_000, 210/1_000_000
+            print(
+                results.marginal_totals, results.marginals_match, results.diff_marginals
             )
-            print(results.diff_types, results.diff_vintages, results.diff_marginals)
 
         except Exception as err:
             raise Exception(err)  # FIXME be more specific
