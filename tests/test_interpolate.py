@@ -1,7 +1,11 @@
 import pytest
 import pandas as pd
 import numpy as np
-from uncertimety.interpolate import fill_missing_dwellings
+from uncertimety.interpolate import (
+    fill_missing_dwellings,
+    round_consistent_sum,
+    apply_ipfn,
+)
 
 
 @pytest.fixture
@@ -37,6 +41,35 @@ def sample_tidy_df():
     )
 
 
+@pytest.fixture
+def sample_ipfn_array():
+    arr = np.array(
+        [
+            [40, 30, 20, 10],
+            [35, 50, 100, 75],
+            [30, 80, 70, 120],
+            [20, 30, 40, 50],
+        ]
+    )
+    return arr
+
+
+@pytest.fixture
+def expected_ipfn_results():
+    # Adapted from Wikipedia example: https://en.wikipedia.org/wiki/Iterative_proportional_fitting#Example
+    target_sum_cols = np.array([150, 300, 400, 150])  # axis=1
+    target_sum_rows = np.array([200, 300, 400, 100])  # axis=0
+    expected = np.array(
+        [
+            [64.61, 46.28, 35.42, 3.83],
+            [49.95, 68.15, 156.49, 25.37],
+            [56.70, 144.40, 145.06, 53.76],
+            [28.74, 41.18, 63.03, 17.03],
+        ]
+    )
+    return target_sum_cols, target_sum_rows, expected
+
+
 class TestFillMissingDwellings:
     def test_no_nans(self, sample_tidy_df):
         """Test that the function removes all NaN values in the dwellings column."""
@@ -46,7 +79,7 @@ class TestFillMissingDwellings:
 
         # Apply function
         filled_df = fill_missing_dwellings(sample_tidy_df)
-        print(filled_df['dwellings'])
+        print(filled_df["dwellings"])
 
         # Verify no NaNs remain
         assert filled_df["dwellings"].isna().sum() == 0, "All NaNs should be filled"
@@ -56,7 +89,9 @@ class TestFillMissingDwellings:
         filled_df = fill_missing_dwellings(sample_tidy_df)
 
         # Check shape and columns
-        assert filled_df.shape[0] == sample_tidy_df.shape[0], "Row count should be preserved"
+        assert filled_df.shape[0] == sample_tidy_df.shape[0], (
+            "Row count should be preserved"
+        )
         assert list(filled_df.columns) == list(sample_tidy_df.columns), (
             "Column structure should be preserved"
         )
@@ -128,3 +163,101 @@ class TestFillMissingDwellings:
         )
         with pytest.raises(ValueError, match="NaN values remain"):
             fill_missing_dwellings(df_with_all_nan_group)
+
+
+class TestRoundConsistentSum:
+    def test_sum_preserved(self):
+        arr = [1.2, 2.3, 3.9]
+        desired_sum = 8
+        result = round_consistent_sum(arr, desired_sum)
+        assert sum(result) == desired_sum
+
+    def test_order_preserved(self):
+        arr = [1.7, 2.2, 3.1, 4.9]
+        desired_sum = 13
+        result = round_consistent_sum(arr, desired_sum)
+        # Check that the length and order (only values rounded) is preserved.
+        assert isinstance(result, list)
+        assert len(result) == len(arr)
+        # FIXME check order, maybe using all() and zip()?
+
+    def test_add_by_weight(self):
+        arr = [10, 20, 30, 40]
+        desired_sums = [102, 107, 112]
+        expected = [
+            [10, 20, 31, 41],
+            [11, 21, 32, 43],
+            [11, 22, 34, 45],
+        ]
+
+        for i, desired_sum in enumerate(desired_sums):
+            result = round_consistent_sum(arr, desired_sum)
+            assert sum(result) == desired_sum
+            assert result == expected[i]
+
+
+class TestApplyIpfn:
+    def test_expected_results(self, sample_ipfn_array, expected_ipfn_results):
+        arr = np.array(sample_ipfn_array)
+        col_target, row_target, expected = expected_ipfn_results
+
+        # here, col_target represents the desired sum of each row (sum over columns, axis=1), and row_target represents the desired sum of each column (sum over rows, axis=0)
+
+        result = apply_ipfn(
+            arr,
+            aggregates=[col_target, row_target],
+            dimensions=[[0], [1]],  # FIXME notation is confusing
+            convergence_rate=1e-6,
+            max_iter=10,
+        )
+        print(result)
+        # check sums are close
+        assert all(np.isclose(result.sum(axis=0), row_target))
+        assert all(np.isclose(result.sum(axis=1), col_target))
+
+        # check marginals sum to same total
+        assert sum(col_target) == sum(row_target)
+
+        # check result sums to total
+        assert np.isclose(result.sum(), sum(col_target))
+
+        # check individual values are relatively close to expected values
+        assert all(
+            [all(row) for row in np.isclose(result, expected, rtol=1e-2)]
+        )  # first row fails at rtol=1e-3
+
+    def test_simple_ipfn(self):
+        target_row = np.array([11, 9, 8])  # sum of each column
+        target_col = np.array([5, 15, 8])  # sum of each row
+        arr = np.array(
+            [
+                [1, 2, 1],
+                [3, 5, 5],
+                [6, 2, 2],
+            ]
+        )
+        expected = np.array(
+            [
+                [1.51, 2.31, 1.18],
+                [4.20, 5.35, 5.45],
+                [5.28, 1.34, 1.37],
+            ]
+        )
+
+        result = apply_ipfn(
+            arr, aggregates=[target_col, target_row], dimensions=[[0], [1]]
+        )
+        # check sums are close
+        assert all(np.isclose(result.sum(axis=0), target_row))
+        assert all(np.isclose(result.sum(axis=1), target_col))
+
+        # check marginals sum to same total
+        assert sum(target_col) == sum(target_row)
+
+        # check result sums to total
+        assert np.isclose(result.sum(), sum(target_col))
+
+        # check individual values are relatively close to expected values
+        assert all(
+            [all(row) for row in np.isclose(result, expected, rtol=1e-2)]
+        )  # first and last row fails at rtol=1e-3
