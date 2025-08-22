@@ -1138,8 +1138,8 @@ class TestFindCompatibleVintages:
 
     def test_with_whitespace(self, test_df):
         """Test handling of whitespace in the input vintage"""
-        indices = _find_compatible_vintages(test_df, " 1946-1960 ")
-        vintages = test_df.loc[indices, "vintage"].tolist()
+        compatible = _find_compatible_vintages(test_df, " 1946-1960 ")
+        vintages = compatible["vintage"].to_list()
         assert len(vintages) == 1
         assert "1946-1960" in vintages
 

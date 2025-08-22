@@ -42,6 +42,44 @@ if not CONFIG.exists():
     raise FileNotFoundError(msg)
 
 
+def load_dataset_config(config_path: Path) -> Dict:
+    """Load and validate the dataset configuration."""
+    try:
+        config = load_config(config_path)
+        required_keys = [
+            "dwelling_stock.metadata",
+            "dwelling_stock.historic_vintages",
+            "dwelling_stock.target_dwelling_types",
+        ]
+
+        for key_path in required_keys:
+            parts = key_path.split(".")
+            temp = config
+            for part in parts:
+                if part not in temp:
+                    raise KeyError(f"Missing key: {key_path}")
+                temp = temp[part]
+
+        return config
+    except (FileNotFoundError, toml.TomlDecodeError) as err:
+        logger.error(f"Failed to load configuration from {config_path}: {err}")
+        raise
+
+
+try:
+    config = load_dataset_config(CONFIG)
+    META_COLS = config["dwelling_stock"]["metadata"]
+    HISTORIC_VINTAGES = config["dwelling_stock"]["historic_vintages"]
+    TARGET_TYPES = config["dwelling_stock"]["target_dwelling_types"]
+    MERGED_COLS = [
+        "other_attached_dwelling",
+        "other_dwelling",
+    ]  # fixed, not from config
+except KeyError as err:
+    logger.error(f"Missing expected key in config file {CONFIG}: {err}")
+    raise
+
+
 def dataprep_main(show_progress: bool = False, single_year: str = None):
     """Main function for data preparation.
 
@@ -175,44 +213,6 @@ def tidyfy(df: pd.DataFrame) -> pd.DataFrame:
         .astype({"census_year": int, "vintage": str, "type": str, "dwellings": float})
     )
     return tidy
-
-
-def load_dataset_config(config_path: Path) -> Dict:
-    """Load and validate the dataset configuration."""
-    try:
-        config = load_config(config_path)
-        required_keys = [
-            "dwelling_stock.metadata",
-            "dwelling_stock.historic_vintages",
-            "dwelling_stock.target_dwelling_types",
-        ]
-
-        for key_path in required_keys:
-            parts = key_path.split(".")
-            temp = config
-            for part in parts:
-                if part not in temp:
-                    raise KeyError(f"Missing key: {key_path}")
-                temp = temp[part]
-
-        return config
-    except (FileNotFoundError, toml.TomlDecodeError) as err:
-        logger.error(f"Failed to load configuration from {config_path}: {err}")
-        raise
-
-
-try:
-    config = load_dataset_config(CONFIG)
-    META_COLS = config["dwelling_stock"]["metadata"]
-    HISTORIC_VINTAGES = config["dwelling_stock"]["historic_vintages"]
-    TARGET_TYPES = config["dwelling_stock"]["target_dwelling_types"]
-    MERGED_COLS = [
-        "other_attached_dwelling",
-        "other_dwelling",
-    ]  # fixed, not from config
-except KeyError as err:
-    logger.error(f"Missing expected key in config file {CONFIG}: {err}")
-    raise
 
 
 def clean_name(
@@ -1023,7 +1023,7 @@ def _find_compatible_vintages(df, vintage: str, sep="-"):
         raise ValueError("Vintage must be a string")
 
     # Find non-empty rows
-    non_nans = df.loc[(df.notna().any(axis=1))]
+    non_nans = df.loc[(df.drop('vintage', axis=1).notna().any(axis=1))] # 'vintage' is never nan
 
     # Find compatible vintages
     start, end = [int(years) for years in vintage.strip().split(sep)]
