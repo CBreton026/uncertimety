@@ -3,10 +3,33 @@ import pandas as pd
 import numpy as np
 from operator import itemgetter
 from ipfn import ipfn
+from pathlib import Path
 from uncertimety.logger import init_logger
+from uncertimety.dataprep import load_dataset_config, sort_vintage_labels
 from IPython.display import display  # FIXME only for dev and tests
 
+
 logger = init_logger()
+
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+CONFIG = DATA_DIR / "config.toml"
+if not CONFIG.exists():
+    msg = f"No TOML file found at: {CONFIG}"
+    logger.error(msg)
+    raise FileNotFoundError(msg)
+
+try:
+    config = load_dataset_config(CONFIG)
+    META_COLS = config["dwelling_stock"]["metadata"]
+    HISTORIC_VINTAGES = config["dwelling_stock"]["historic_vintages"]
+    TARGET_TYPES = config["dwelling_stock"]["target_dwelling_types"]
+    MERGED_COLS = [
+        "other_attached_dwelling",
+        "other_dwelling",
+    ]  # fixed, not from config
+except KeyError as err:
+    logger.error(f"Missing expected key in config file {CONFIG}: {err}")
+    raise
 
 
 def interpolate(infile):
@@ -211,13 +234,113 @@ def round_consistent_sum(arr, desired_sum):
     return [value for value, remainder, idx in sorted(temp_sorted, key=itemgetter(2))]
 
 
-def fix_marginals(df: pd.DataFrame, max_iter: int = 500):
-    pass
+def fix_marginals(
+    df: pd.DataFrame,
+    desired_sum=None,
+    label: str = "vintage",
+    dw_types: list[str] = TARGET_TYPES,
+    type_total_label: str = "total",
+    cohort_total_label: str = "1608-2025",
+) -> pd.DataFrame:
+    """
+    Adjust the marginals (row and column totals) in the input DataFrame
+    using the Largest Remainder Method (via round_consistent_sum) so that
+    the component sums match the desired totals.
+
+    The input DataFrame is expected to have a row (indexed by `label`) that
+    serves as the cohort total (with label `cohort_total_label`) and a column
+    (named by `type_total_label`) that is the type total.
+
+    The function first restricts the DataFrame to the target dwelling type columns.
+    To ensure the overall total column isn’t dropped, this revision forces inclusion
+    of `type_total_label` within the filtered columns.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing marginal data.
+        target: (unused) placeholder for potential future use.
+        label (str): The categorical column holding the index (e.g., 'vintage').
+        dw_types (list[str]): List of dwelling types to process. If not all target types are
+            contained, then the overall total (type_total_label) is added.
+        type_total_label (str): Column name for the type total.
+        cohort_total_label (str): Row label for the cohort total.
+
+    Returns:
+        pd.DataFrame: A DataFrame with adjusted marginals. The nonzero cells are adjusted
+        via the Largest Remainder Method, then the zeros are concatenated back.
+
+    Raises:
+        KeyError: If the expected labels are missing from the DataFrame.
+    """
+    # NOTE In the future, it might be relevant to first treat the target types, and then 'reverse-engineer' the subcategories
+    # Set index based on label if available.
+    if label in df.columns:
+        working_df = df.copy().set_index(label)
+    else:
+        working_df = df.copy()
+
+    # Ensure we keep only the relevant columns, and convert dataset to float.
+    # Force inclusion of type_total_label even if not present in dw_types.
+    cols_to_keep = list(set(dw_types) | {type_total_label})
+    working_df = working_df.loc[:, cols_to_keep].astype("float")
+
+    # Only keep nonzero values; there can be no 'zero' values for the IPFN procedure; small (i.e. close to zero) values must be set to arbitrary small values (e.g., orders of magnitude smaller than actual data) beforehand
+    # this method first converts values where condition is false to nans, then drop the nan rows
+    nonzeros = working_df.where(working_df > 0).dropna()
+    zeros = working_df.where(working_df == 0).dropna()
+
+    # Extract current marginals
+    try:
+        if desired_sum is None:  # allows to set arbitrary desired_sums
+            desired_sum = nonzeros.loc[cohort_total_label, type_total_label]
+
+        cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
+            type_total_label
+        ].to_numpy()
+        type_marginals = (
+            nonzeros.drop(type_total_label, axis=1)
+            .loc[cohort_total_label, :]
+            .to_numpy()
+        )
+    except KeyError as err:
+        logger.error(f"Missing expected label in DataFrame: {err}")
+        raise
+
+    # Adjust marginals using Largest Remainder Method
+    adj_type_marginals = round_consistent_sum(type_marginals, desired_sum)
+    adj_cohort_marginals = round_consistent_sum(cohort_marginals, desired_sum)
+
+    # Identify target indexes and columns
+    rows = nonzeros.index[nonzeros.index != cohort_total_label]
+    cols = [col for col in nonzeros.columns if col != type_total_label]
+
+    # Log the modifications  # TODO also return them, e.g, through a dataclass?
+    logger.info(
+        f"Modified type marginals: {sum(adj_type_marginals - type_marginals)} units ({adj_type_marginals - type_marginals}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
+    )
+    logger.info(
+        f"Modified cohort marginals: {sum(adj_cohort_marginals - cohort_marginals)} units ({adj_cohort_marginals - cohort_marginals}) from {nonzeros.loc[rows, type_total_label].to_json()}"
+    )
+
+    # Assign results to DataFrame
+    # For the type totals: assign to all rows except the cohort total row.
+    nonzeros.loc[rows, type_total_label] = pd.Series(adj_cohort_marginals, index=rows)
+
+    # For the cohort total: assign to all columns except the type_total column.
+    nonzeros.loc[cohort_total_label, cols] = pd.Series(adj_type_marginals, index=cols)
+
+    # For the desired_sum value
+    nonzeros.loc[cohort_total_label, type_total_label] = desired_sum
+
+    # Concat nonzeros and zero data
+    result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
+
+    col_order = ["total"] + sorted(dw_types)
+    return result[col_order]
 
 
 def apply_ipfn(
     arr: np.array,
-    aggregates: list[list],
+    aggregates: list[list[float]],
     dimensions: list[list[int]],
     convergence_rate=1e-6,
     max_iter: int = 500,
@@ -251,6 +374,18 @@ def apply_ipfn(
     return result
 
 
+def reconcile_data_with_marginals():
+    # accept dataframe
+    # first, fix_marginals
+    # then, apply_ipfn
+    # return new dataframe
+    # compare to old dataframe
+    # NOTE should we 'protect' data
+    # zeros = working_df.where(working_df == 0)  # FIXME dropna
+    # arr_ini = nonzeros.drop(columns=[type_total_label], index=[cohort_total_label]).to_numpy()
+    pass
+
+
 if __name__ == "__main__":
     infile = "./data/clean/fulldata.parquet"
     df, mask = interpolate(infile)
@@ -259,3 +394,88 @@ if __name__ == "__main__":
     display(apply_rawdata_mask(df, mask))
 
 # TODO: look at the 'corrected' values, and at everything with "_fix" suffix
+
+""" TODO implement this logic
+# If cond (the mask) is true (i.e., if there awas NaN in original dataframe, then overwrite the value with NaN. if not, keep original value.
+# https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.mask.html
+
+res_fix = {}
+for year in new_csdw:
+    print(year)
+    # df = new_csdw[year]
+    # df, _ = fix_marginals(df)
+
+    # If cond (the mask) is true (i.e., if there awas NaN in original dataframe, then overwrite the value with NaN. if not, keep original value.
+    # https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.mask.html
+    df = new_csdw[year].copy().mask(new_csdw_mask[year].isna()).set_index("vintage")
+
+    # Identify cols with nans
+    target_cols = (df.isna().any(axis=0)).to_numpy()
+    print(target_cols, target_cols.any())
+
+    # Here there are two cases: 1) all cols are defined, 2) there are missing data in some cols. if there are no target cols, then simply run the fix_marginals on the original dataframe.
+    display(df)
+
+    if not target_cols.any():  # check if any cols is true
+        d, _ = fix_marginals(df)
+    else:
+        # Add 'total' to target columns for all cases
+        target_cols[0] = True
+
+        # get values from original, non-masked dataframe (i.e. the one containing backfilled interpolated values), but filtered on nan columns
+        aa = new_csdw[year].copy().set_index("vintage").loc[:, target_cols]
+        bb = new_csdw[year].copy().set_index("vintage").loc[:, ~target_cols]
+
+        # The totals are too high; must remove the known values
+        aa["total"] -= df.loc[:, ~(target_cols)].sum(axis=1)
+
+        # FIXME TEMP
+        display(aa)
+        display(bb)
+
+        # then find marginals
+        b, _ = fix_marginals(aa)
+        display(b)
+
+        cc = pd.concat([b, bb], axis=1).sort_index()
+        cc["total"] = cc.loc[:, "apartments":].sum(axis=1)
+
+        # test second pass  # FIXME
+        d, _ = fix_marginals(cc)
+        # display(d)
+        # print(d.iloc[1:,:].sum(axis=0).tolist())
+        # print(d.iloc[:,1:].sum(axis=1).tolist())
+
+    res_fix[year] = d[["total"] + agg_types]
+
+    # Check for errors
+    if year in [1991, 1996]:
+        display(df)
+        display(aa)
+        display(bb)
+        display(res_fix[year])
+"""
+# TODO import old_cs_data // cs_data, including update for paper 3 (update_ppd)
+
+""" TODO plot the data, and compare with initial parquet dataset. maybe save figures? use a notebook to demonstrate the workflow, print the figures?
+sns.relplot(
+    d,
+    x="year",
+    y="dwellings",
+    hue="type",
+    row="vintage",
+    col="dataset",  # method, 'res' or 'res_fix'
+    kind="line",
+    facet_kws={
+        "sharey": "row",
+    },
+)
+
+plt.tight_layout()
+plt.show()
+
+# fig, ax = plt.subplots()
+# csdw_itp[(csdw_itp.index.get_level_values('vintage')=='0-2025') & (csdw_itp.index.get_level_values('type').isin(agg_types))].unstack(['type','vintage']).plot(ax=ax, legend=True)
+# sns.move_legend(ax, loc='center left', bbox_to_anchor=[1,0.5])
+
+"""

@@ -5,6 +5,7 @@ from uncertimety.interpolate import (
     fill_missing_dwellings,
     round_consistent_sum,
     apply_ipfn,
+    fix_marginals,
 )
 
 
@@ -68,6 +69,20 @@ def expected_ipfn_results():
         ]
     )
     return target_sum_cols, target_sum_rows, expected
+
+
+@pytest.fixture
+def sample_marginals_df():
+    data = {
+        "vintage": ["1608-2025", "1608-1920", "1921-1945", "1946-1960", "2020-2025"],
+        "total": [800, 260, 300, 240, 0],
+        "single_attached": [100, 20, 50, 30, 0],
+        "apartments": [220, 80, 100, 40, 0],
+        "single_detached": [280, 100, 120, 60, 0],
+        "mobile": [200, 80, 80, 40, 0],
+        "some_other_col": [None, None, None, None, None],
+    }
+    return pd.DataFrame(data)
 
 
 class TestFillMissingDwellings:
@@ -261,3 +276,63 @@ class TestApplyIpfn:
         assert all(
             [all(row) for row in np.isclose(result, expected, rtol=1e-2)]
         )  # first and last row fails at rtol=1e-3
+
+
+class TestFixMarginals:
+    def test_correct_shape(self, sample_marginals_df):
+        # Use dw_types that might come from config plus ensure inclusion of 'total'
+        dw_types = ["single_detached", "single_attached", "apartments", "mobile"]
+
+        result = fix_marginals(
+            sample_marginals_df,
+            label="vintage",
+            dw_types=dw_types,
+            type_total_label="total",
+            cohort_total_label="1608-2025",
+        )
+        # Expect same number of rows as input (with vintage as index) and columns = dw_types U {total}
+        expected_cols = set(dw_types + ["total"])
+        assert set(result.columns) == expected_cols
+        assert result.shape[0] == sample_marginals_df.shape[0]
+
+    def test_marginals_match(self, sample_marginals_df):
+        # Here we expect that the adjusted marginals will have the overall totals matching.
+        dw_types = ["single_detached", "single_attached", "apartments", "mobile"]
+        result = fix_marginals(
+            sample_marginals_df,
+            desired_sum=900,
+            label="vintage",
+            dw_types=dw_types,
+            type_total_label="total",
+            cohort_total_label="1608-2025",
+        )
+        # The "total" values by type and cohort should match, and be consistent with the desired sum
+
+        # Check that the desired_sum was enforced
+        assert result.loc["1608-2025", "total"] == 900
+
+        # Check that the cohort sums and type sums match with the desired_sum
+        cohort_marginals = result.drop("1608-2025", axis=0).loc[:, "total"].sum()
+        type_marginals = result.drop("total", axis=1).loc["1608-2025", :].sum()
+        assert cohort_marginals == type_marginals, (
+            "Row totals do not match cohort total as expected."
+        )
+        assert cohort_marginals == 900
+
+    def test_expected_values(seld, sample_marginals_df):
+        dw_types = ["single_detached", "single_attached", "apartments", "mobile"]
+        result = fix_marginals(
+            sample_marginals_df,
+            desired_sum=798,
+            label="vintage",
+            dw_types=dw_types,
+            type_total_label="total",
+            cohort_total_label="1608-2025",
+        )
+        assert all(
+            result.loc["1608-2025", :].to_numpy() == np.array([798, 219, 200, 100, 279])
+        )  # type marginals
+        assert all(
+            result.loc[:, "total"].to_numpy().ravel()
+            == np.array([798, 259, 299, 240, 0])
+        )  # cohort marginals
