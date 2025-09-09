@@ -259,8 +259,7 @@ def fix_marginals(
         df (pd.DataFrame): DataFrame containing marginal data.
         target: (unused) placeholder for potential future use.
         label (str): The categorical column holding the index (e.g., 'vintage').
-        dw_types (list[str]): List of dwelling types to process. If not all target types are
-            contained, then the overall total (type_total_label) is added.
+        dw_types (list[str]): List of dwelling types to process. Assumes type_total_label is included in dw_types
         type_total_label (str): Column name for the type total.
         cohort_total_label (str): Row label for the cohort total.
 
@@ -280,8 +279,12 @@ def fix_marginals(
 
     # Ensure we keep only the relevant columns, and convert dataset to float.
     # Force inclusion of type_total_label even if not present in dw_types.
-    cols_to_keep = list(set(dw_types) | {type_total_label})
+    cols_to_keep = [type_total_label] + [
+        col for col in sorted(dw_types) if col in df.columns and col != type_total_label
+    ]
     working_df = working_df.loc[:, cols_to_keep].astype("float")
+
+    # FIXME: this function does too much at once, everything above here might best be relegated to the reconcile_data_with_marginals function?
 
     # Only keep nonzero values; there can be no 'zero' values for the IPFN procedure; small (i.e. close to zero) values must be set to arbitrary small values (e.g., orders of magnitude smaller than actual data) beforehand
     # this method first converts values where condition is false to nans, then drop the nan rows
@@ -314,12 +317,21 @@ def fix_marginals(
     cols = [col for col in nonzeros.columns if col != type_total_label]
 
     # Log the modifications  # TODO also return them, e.g, through a dataclass?
-    logger.info(
-        f"Modified type marginals: {sum(adj_type_marginals - type_marginals)} units ({adj_type_marginals - type_marginals}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
-    )
-    logger.info(
-        f"Modified cohort marginals: {sum(adj_cohort_marginals - cohort_marginals)} units ({adj_cohort_marginals - cohort_marginals}) from {nonzeros.loc[rows, type_total_label].to_json()}"
-    )
+    type_diff = adj_type_marginals - type_marginals
+    cohort_diff = adj_cohort_marginals - cohort_marginals
+
+    if type_diff.sum() + cohort_diff.sum() == 0:
+        logger.info("Marginals fit; no modifications required.")
+    else:
+        if sum(type_diff) != 0:
+            logger.info(
+                f"Modified type marginals: {sum(type_diff)} units ({type_diff}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
+            )
+
+        if sum(cohort_diff) != 0:
+            logger.info(
+                f"Modified cohort marginals: {sum(cohort_diff)} units ({cohort_diff}) from {nonzeros.loc[rows, type_total_label].to_json()}"
+            )
 
     # Assign results to DataFrame
     # For the type totals: assign to all rows except the cohort total row.
@@ -334,8 +346,8 @@ def fix_marginals(
     # Concat nonzeros and zero data
     result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
 
-    col_order = ["total"] + sorted(dw_types)
-    return result[col_order]
+    # col_order = ["total"] + sorted(dw_types)
+    return result
 
 
 def apply_ipfn(
@@ -374,16 +386,74 @@ def apply_ipfn(
     return result
 
 
-def reconcile_data_with_marginals():
+def reconcile_data_with_marginals(
+    df: pd.DataFrame,
+    label: str = "vintage",
+    desired_sum: int = None,
+    dw_types: list[str] = TARGET_TYPES,
+    type_total_label: str = "total",
+    cohort_total_label: str = "1608-2025",
+    convergence_rate=1e-6,
+    max_iter: int = 500,
+):
+    # NOTE should we protect initial data?
+
     # accept dataframe
+    working_df = df.copy()
+
     # first, fix_marginals
+    working_df = fix_marginals(
+        working_df,
+        desired_sum=desired_sum,
+        label=label,
+        dw_types=dw_types,
+        type_total_label=type_total_label,
+        cohort_total_label=cohort_total_label,
+    )
+
     # then, apply_ipfn
-    # return new dataframe
-    # compare to old dataframe
-    # NOTE should we 'protect' data
-    # zeros = working_df.where(working_df == 0)  # FIXME dropna
-    # arr_ini = nonzeros.drop(columns=[type_total_label], index=[cohort_total_label]).to_numpy()
-    pass
+    nonzeros = working_df.where(working_df > 0).dropna()
+    zeros = working_df.where(working_df == 0).dropna()
+
+    cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
+        type_total_label
+    ].to_numpy()
+    type_marginals = (
+        nonzeros.drop(type_total_label, axis=1).loc[cohort_total_label, :].to_numpy()
+    )
+
+    arr_ini = nonzeros.drop(
+        index=[cohort_total_label], columns=[type_total_label]
+    ).to_numpy()
+
+    arr_new = apply_ipfn(
+        arr=arr_ini.copy(),
+        aggregates=[cohort_marginals, type_marginals],
+        dimensions=[[0], [1]],  # dimension over which the 'sum' is made
+        convergence_rate=convergence_rate,
+        max_iter=max_iter,
+    )
+    diff = (arr_new - arr_ini).round(decimals=2)
+    logger.info(f"Initial array before IPFN: {arr_ini.ravel()}")
+    logger.info(f"IPFN adjustment difference (rounded): {diff.ravel()}")
+    logger.info(
+        f"Sum of IPFN adjustment difference: {diff.sum().round(decimals=2)}"
+    )  # NOTE: this should match the marginal adjustment
+
+    target_rows = nonzeros.index[nonzeros.index != cohort_total_label]
+    target_cols = [col for col in nonzeros.columns if col != type_total_label]
+    nonzeros.loc[target_rows, target_cols] = (
+        arr_new.round()
+    )  # FIXME, overwrite with a dataframe of target_rows, target_cols? REPRENDRE ICI
+
+    result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
+    display(result)
+    print(result.to_numpy().ravel())
+    print(diff.sum())
+    return (
+        result,
+        diff,
+    )  # FIXME improve logging and tests by instead returning a container (dataclass) with relevant information, e.g., result, diff, type and cohort marginals adjustements, etc.?
 
 
 if __name__ == "__main__":

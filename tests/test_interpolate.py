@@ -6,6 +6,7 @@ from uncertimety.interpolate import (
     round_consistent_sum,
     apply_ipfn,
     fix_marginals,
+    reconcile_data_with_marginals,
 )
 
 
@@ -336,3 +337,46 @@ class TestFixMarginals:
             result.loc[:, "total"].to_numpy().ravel()
             == np.array([798, 259, 299, 240, 0])
         )  # cohort marginals
+
+
+class TestReconcileDataWithMarginals:
+    def test_returns_expected_result(self, sample_marginals_df):
+        expected = np.array(
+            [
+                800,
+                220,
+                200,
+                100,
+                280,
+                260,
+                75,
+                74,
+                18,
+                92,
+                300,
+                87,
+                69,
+                41,
+                103,
+                240,
+                58,
+                57,
+                41,
+                85,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        )
+
+        result, _ = reconcile_data_with_marginals(sample_marginals_df)
+        assert all(np.isclose(result.to_numpy().ravel(), expected))
+
+    def test_diff_matches_marginals(self, sample_marginals_df):
+        result, diff = reconcile_data_with_marginals(
+            sample_marginals_df,
+            desired_sum=900,
+        )
+        assert np.isclose(diff.sum(), 100, atol=5e-2)
