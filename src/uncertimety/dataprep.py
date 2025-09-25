@@ -150,7 +150,8 @@ def dataprep_main(show_progress: bool = False, single_year: str = None):
     # 'Manually' add previous census data
     complete_data = overwrite_census_dataset(
         standardized_data, filename="old_cs_data.toml"
-    )  # FIXME not super clean, import all data at the start?
+    )  # FIXME not super clean, import all data at the start? for now, putting this before L.130 creates a bug (TypeError), probably due to incompatible index/columns (?)
+    # NOTE here I'd like to check the marginals and counts; however to do so, we must first interpolate at least the marginals.. chicken and the egg? for now let's leave it. At this point, a lot of marginals don't match, and this will be fixed in interpolate.py
 
     # Create path, save contents as html for reviewing
     # Check if dir exists
@@ -577,7 +578,18 @@ def overwrite_census_dataset(
                 ref_df["vintage"] = dataframes["2021"]["vintage"]
 
                 # Add total values
-                ref_df.loc[ref_df["vintage"] == "1608-2025", cols] = group[cols].to_numpy()
+                ref_df.loc[ref_df["vintage"] == "1608-2025", cols] = group[
+                    cols
+                ].to_numpy()
+
+                # Set known values if before 1920
+                if int(census_year) <= 1920:
+                    mask = ref_df["vintage"].apply(
+                        lambda v: int(v.split("-")[0])
+                        <= census_year
+                        <= int(v.split("-")[1])
+                    )
+                    ref_df.loc[mask, cols] = group[cols].to_numpy()
 
                 # Set known zeros
                 mask = ref_df["vintage"].apply(
