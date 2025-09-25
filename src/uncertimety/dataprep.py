@@ -16,7 +16,7 @@ Usage:
 """
 
 import re
-import toml
+import toml  # TODO replace w/ built-in tomllib module
 import itertools
 import pandas as pd
 import numpy as np
@@ -147,13 +147,18 @@ def dataprep_main(show_progress: bool = False, single_year: str = None):
 
         display(standardized_data[census_year])
 
+    # 'Manually' add previous census data
+    complete_data = overwrite_census_dataset(
+        standardized_data, filename="old_cs_data.toml"
+    )  # FIXME not super clean, import all data at the start?
+
     # Create path, save contents as html for reviewing
     # Check if dir exists
     if not Path("./data/clean").exists():
         Path("./data/clean").mkdir(parents=True, exist_ok=True)
 
     # Prepare curated dataset
-    dataset = pd.concat(standardized_data).sort_index()
+    dataset = pd.concat(complete_data).sort_index()
     dataset = filter_relevant_types_vintages(
         dataset,
         keep_other_cols=True,
@@ -440,6 +445,7 @@ def load_and_normalize_overwrites(toml_file: str) -> dict:
     Loads and normalizes overwrite data from TOML.
     Replaces TOML-safe placeholders (-1) with Python None and corrects field names.
     """
+    # FIXME just replace with tommlib, go to a dict, then create DF from dict?
     # FIXME - not DRY compared to config_loader - use it, e.g., in overwrite_census_dataset?
 
     with open(toml_file, "r") as f:
@@ -502,7 +508,9 @@ def patch_vintage_and_trim(df, instructions):
 
 
 def overwrite_census_dataset(
-    dataframes: Dict[str, pd.DataFrame], data_dir: str = DATA_DIR
+    dataframes: Dict[str, pd.DataFrame],
+    data_dir: str = DATA_DIR,
+    filename: str = "manual_overwrite.toml",
 ) -> Dict[str, pd.DataFrame]:
     # TODO add unittests relevant for this function, and the functions it calls (load_and_normalize_overwrites, patch_vintage_and_trim, apply_overwrites)
     """
@@ -515,13 +523,72 @@ def overwrite_census_dataset(
     Returns:
         dict: The updated dictionary of DataFrames.
     """
-    infile = data_dir / "manual_overwrite.toml"
+    infile = data_dir / filename
 
     if not infile:
         msg = f"No TOML file found for path: {infile}"
         logger.error(msg)
         raise ValueError(msg)
 
+    # Temporary fix when importing from files other than "manual_overwrite.toml" - this should be more uniform
+    if filename != "manual_overwrite.toml":
+        overwrites = load_and_normalize_overwrites(infile)[
+            "census_data"
+        ]  # access inner dict
+        overwrites = pd.DataFrame.from_dict(overwrites)
+        groups = pd.DataFrame.from_dict(overwrites).groupby("year")
+
+        for name, group in groups:
+            census_year = group["year"].to_numpy()[
+                0
+            ]  # gets 'year' of first (and only) valid index
+            cols = [
+                col for col in group.columns if col not in ["year", "population"]
+            ]  # don't need population for now
+
+            if str(census_year) in dataframes:
+                # TODO check data for fit
+                old_vals = dataframes[str(census_year)].loc[
+                    dataframes[str(census_year)]["vintage"] == "1608-2025", cols
+                ]
+                new_vals = group[cols]
+                match = np.isclose(
+                    old_vals.to_numpy(),
+                    new_vals.to_numpy(),
+                    atol=5,
+                    rtol=1e-5,
+                    equal_nan=True,
+                )
+
+                if match.all():
+                    continue
+                else:
+                    logger.warning(
+                        f"Census year {census_year}: there is a difference between new and old values. \n{match}\n{old_vals}\n{new_vals}"
+                    )
+                    # TODO: for now, this only logs a warning about the difference. In the future, we should add a overwrite parameter which, if True, would overwrite the corresponding data in 'dataframes[census_year]'. As the data from 'old_cs_data' is not necessarily better than the data from B2020 and the 'manual_overwrites', I don't believe this is required for now - it just confirms the inconsistencies in the source data
+                    continue
+
+            else:
+                # Create new dataframe
+                logger.info(f"Creating new DataFrame for year {census_year}")
+                ref_df = pd.DataFrame().reindex_like(dataframes["2021"])
+                ref_df["census_year"] = census_year
+                ref_df["vintage"] = dataframes["2021"]["vintage"]
+
+                # Add total values
+                ref_df.loc[ref_df["vintage"] == "1608-2025", cols] = group[cols]
+
+                # Set known zeros
+                mask = ref_df["vintage"].apply(
+                    lambda vintage: int(vintage.split("-")[0]) > census_year
+                )
+                ref_df.loc[mask, "total":] = 0
+
+                dataframes[str(census_year)] = ref_df
+        return dataframes
+
+    # Regular case (manual_overwrites.toml)
     overwrites = load_and_normalize_overwrites(infile)
 
     for year, instructions in overwrites.items():
@@ -1023,7 +1090,9 @@ def _find_compatible_vintages(df, vintage: str, sep="-"):
         raise ValueError("Vintage must be a string")
 
     # Find non-empty rows
-    non_nans = df.loc[(df.drop('vintage', axis=1).notna().any(axis=1))] # 'vintage' is never nan
+    non_nans = df.loc[
+        (df.drop("vintage", axis=1).notna().any(axis=1))
+    ]  # 'vintage' is never nan
 
     # Find compatible vintages
     start, end = [int(years) for years in vintage.strip().split(sep)]
