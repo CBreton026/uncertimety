@@ -577,7 +577,7 @@ def overwrite_census_dataset(
                 ref_df["vintage"] = dataframes["2021"]["vintage"]
 
                 # Add total values
-                ref_df.loc[ref_df["vintage"] == "1608-2025", cols] = group[cols]
+                ref_df.loc[ref_df["vintage"] == "1608-2025", cols] = group[cols].to_numpy()
 
                 # Set known zeros
                 mask = ref_df["vintage"].apply(
