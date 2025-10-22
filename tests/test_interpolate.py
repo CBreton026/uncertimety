@@ -7,6 +7,7 @@ from uncertimety.interpolate import (
     apply_ipfn,
     fix_marginals,
     reconcile_data_with_marginals,
+    pivot_with_mask,
 )
 
 
@@ -84,6 +85,43 @@ def sample_marginals_df():
         "some_other_col": [None, None, None, None, None],
     }
     return pd.DataFrame(data)
+
+
+@pytest.fixture
+def sample_marginals_mask(sample_marginals_df):
+    mask = pd.DataFrame(
+        True, index=sample_marginals_df.index, columns=sample_marginals_df.columns
+    )
+    mask["some_other_col"] = False  # TODO test with a 'false' at 0?
+    mask.loc[2:3, "mobile"] = False
+    mask.loc[1:2, "single_attached"] = False
+    mask.loc[4, "apartments"] = False
+    return mask
+
+
+@pytest.fixture
+def simple_df():
+    return pd.DataFrame(
+        {
+            "vintage": ["1608-1920", "1608-1920", "1921-1945", "1921-1945"],
+            "type": ["apartments", "single_detached", "apartments", "single_detached"],
+            "dwellings": [100, 200, 300, 400],
+        }
+    )
+
+
+@pytest.fixture
+def simple_mask():
+    # Trusted: first apartments (100) and last single_detached (400)
+    """FIXME should be created directly from simple_df"""
+    mask = pd.DataFrame(
+        {
+            "vintage": ["1608-1920", "1608-1920", "1921-1945", "1921-1945"],
+            "type": ["apartments", "single_detached", "apartments", "single_detached"],
+            "dwellings": [True, False, False, True],
+        }
+    )
+    return mask
 
 
 class TestFillMissingDwellings:
@@ -380,3 +418,99 @@ class TestReconcileDataWithMarginals:
             desired_sum=900,
         )
         assert np.isclose(diff.sum(), 100, atol=5e-2)
+
+
+class TestPivotWithMask:
+    def test_sample_df(self, simple_df, simple_mask):
+        """Test the pivot_with_mask function."""
+        # Get sample tidy data, and a sample dataframe "mask" where some values are trusted (True) and other are not (False), keeping all other columns equal
+        df, mask_df = pivot_with_mask(simple_df, simple_mask)
+
+        # Check results
+        expected_df = pd.DataFrame(
+            {
+                "apartments": [100, 300],
+                "single_detached": [200, 400],
+            },
+            index=pd.Index(["1608-1920", "1921-1945"], name="vintage"),
+        )
+        expected_df.columns.name = "type"
+
+        expected_mask = pd.DataFrame(
+            {
+                "apartments": [True, False],
+                "single_detached": [False, True],
+            },
+            index=pd.Index(["1608-1920", "1921-1945"], name="vintage"),
+        )
+        expected_mask.columns.name = "type"
+
+        pd.testing.assert_frame_equal(df, expected_df)
+        pd.testing.assert_frame_equal(mask_df, expected_mask)
+
+    def test_pivot_with_mask_from_marginals(
+        self, sample_marginals_df, sample_marginals_mask
+    ):  # TODO validate relevance? is this only to 100% confirm that the mask 'followed'?
+        """pivot_with_mask should pivot values and correctly align the boolean mask."""
+        tidy = sample_marginals_df.melt(
+            id_vars="vintage", var_name="type", value_name="dwellings"
+        )
+        tidy_mask = sample_marginals_mask.melt(
+            id_vars="vintage", var_name="type", value_name="dwellings"
+        )
+        tidy_mask["vintage"] = tidy["vintage"]
+
+        # --- run function under test ---
+        df, mask_df = pivot_with_mask(tidy, tidy_mask)
+        print(df)
+
+        # --- expected pivoted dataframe (values) ---
+        expected_df = pd.DataFrame(
+            {
+                "apartments": [80, 220, 100, 40, 0],
+                "mobile": [80, 200, 80, 40, 0],
+                "single_attached": [20, 100, 50, 30, 0],
+                "single_detached": [100, 280, 120, 60, 0],
+                "some_other_col": [None, None, None, None, None],
+                "total": [260, 800, 300, 240, 0],
+            },
+            index=pd.Index(
+                ["1608-1920", "1608-2025", "1921-1945", "1946-1960", "2020-2025"],
+                name="vintage",
+            ),
+        )
+        expected_df.columns.name = "type"
+        print(expected_df)
+
+        # --- expected mask (boolean) ---
+        expected_mask = pd.DataFrame(
+            {
+                "apartments": [
+                    True,
+                    True,
+                    True,
+                    True,
+                    False,
+                ],  # apartments 1608-1920 → False
+                "mobile": [True, True, False, False, True],
+                "single_attached": [False, True, False, True, True],
+                "single_detached": [
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],  # single_detached 1921-1945 → False
+                "some_other_col": [False, False, False, False, False],
+                "total": [True, True, True, True, True],
+            },
+            index=pd.Index(
+                ["1608-1920", "1608-2025", "1921-1945", "1946-1960", "2020-2025"],
+                name="vintage",
+            ),
+        )
+        expected_mask.columns.name = "type"
+
+        # --- assertions ---
+        pd.testing.assert_frame_equal(df, expected_df, check_dtype=False)
+        pd.testing.assert_frame_equal(mask_df, expected_mask, check_dtype=False)

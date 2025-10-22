@@ -4,6 +4,7 @@ import numpy as np
 from operator import itemgetter
 from ipfn import ipfn
 from pathlib import Path
+from typing import Optional
 from uncertimety.logger import init_logger
 from uncertimety.dataprep import load_dataset_config, sort_vintage_labels
 from IPython.display import display  # FIXME only for dev and tests
@@ -49,7 +50,9 @@ def apply_rawdata_mask(
     df: pd.DataFrame, mask, by: list[str] = ["census_year", "vintage", "type"]
 ):
     # TODO make sure the mask is passed on the correct data! see comments in temp.ipynb
-    rawdata_df = df.groupby(by).sum(min_count=1).reset_index()
+    rawdata_df = (
+        df.groupby(by).sum(min_count=1).reset_index()
+    )  # FIXME replace with get_rawdata_mask?
 
     # ensure that the mask is applied to the correct data
     all_equal = all(
@@ -135,11 +138,16 @@ def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
     # Process each group
     filled_groups = []
     for name, group in groups:
+        display(group.head(5))  # FIXME remove
         filled_group = group.copy()
+
+        # TODO FIXME REPRENDRE - here one issue is that since I backfill everything, there may be some categories e.g., single_attached, for which the only available data is very recent; imagine for single_detached, older values were available; then, bfill would project *wrong* values backwards, and would shift the typesplit. I might have to do the 'totals' first, since I have the most data; then do a fix marginals; then bfill? However, doing that would ALSO shift the typesplit. should the bfill interpolation be limited to a given number of sequntial nans? or should I use a combination of ffill/bfill?
 
         # Apply backward fill on the dwellings column
         filled_group["dwellings"] = filled_group["dwellings"].bfill()
-        print(filled_group["dwellings"].iloc[-1])
+        # FIXME REPRENDRE the backfill is way too high for older data, i.e., data before 19XX. thus, use two passes -- see unfm_fix [ Finalized dataset, 1851-2021]
+
+        # print(filled_group["dwellings"].iloc[-1])  # FIXME logging
 
         if math.isnan(filled_group["dwellings"].iloc[-1]):
             # Edge case where the last value of a group was a nan, leading to unfilled values
@@ -386,6 +394,31 @@ def apply_ipfn(
     return result
 
 
+def pivot_with_mask(
+    group, trusted_data_mask, index="vintage", columns="type", values="dwellings"
+):
+    """
+    Pivot the given group DataFrame and its corresponding trusted data mask into wide format.
+
+    Args:
+        group (pd.DataFrame): The DataFrame to pivot, typically a group from groupby.
+        trusted_data_mask (pd.DataFrame): Boolean mask DataFrame indicating trusted data.
+        index (str): Column to use as the new index.
+        columns (str): Column to use to make new columns.
+        values (str): Column to populate values in the pivoted DataFrame.
+
+    Returns:
+        tuple: A tuple (df, mask) where df is the pivoted DataFrame and mask is the pivoted mask DataFrame.
+    """
+    df = group.pivot(index=index, columns=columns, values=values)
+    mask = (
+        trusted_data_mask.loc[group.index]
+        # .assign(value=rawdata_mask.loc[group.index, values])  # FIXME Useless?
+        .pivot(index=index, columns=columns, values=values)
+    )
+    return df, mask
+
+
 def reconcile_data_with_marginals(
     df: pd.DataFrame,
     label: str = "vintage",
@@ -395,25 +428,61 @@ def reconcile_data_with_marginals(
     cohort_total_label: str = "1608-2025",
     convergence_rate=1e-6,
     max_iter: int = 500,
-):
+    protect_original: Optional[
+        pd.DataFrame
+    ] = None,  # pass a mask if you want to protect the original data
+) -> pd.DataFrame:
     # NOTE should we protect initial data?
 
     # accept dataframe
     working_df = df.copy()
 
-    # first, fix_marginals
-    working_df = fix_marginals(
-        working_df,
-        desired_sum=desired_sum,
-        label=label,
-        dw_types=dw_types,
-        type_total_label=type_total_label,
-        cohort_total_label=cohort_total_label,
-    )
+    # add option to protect initial data
+    if protect_original is not None:
+        protected = None
+        unprotected = None
+        working_df = fix_marginals(
+            working_df,
+            desired_sum=desired_sum,
+            label=label,
+            dw_types=dw_types,
+            type_total_label=type_total_label,
+            cohort_total_label=cohort_total_label,
+        )
+        working_df = working_df.replace(
+            0, 0.1
+        )  # FIXME; here, replacing all zeros doesn't work, I need to replace only 'Nan' zeros, and zeros in totals
+    else:
+        # first, fix_marginals
+        working_df = fix_marginals(
+            working_df,
+            desired_sum=desired_sum,
+            label=label,
+            dw_types=dw_types,
+            type_total_label=type_total_label,
+            cohort_total_label=cohort_total_label,
+        )  # FIXME: this can return dataframes with zeroes, which can lead to issues in the IPFN. For now, kept for legacy tests; this might need to be corrected, like in the case where protect_original is passed a mask.
+    print(working_df)  # TODO delete
 
     # then, apply_ipfn
-    nonzeros = working_df.where(working_df > 0).dropna()
-    zeros = working_df.where(working_df == 0).dropna()
+    try:
+        nonzeros = working_df.where(working_df > 0).dropna()
+        zeros = working_df.where(working_df == 0).dropna()
+        if nonzeros.empty:
+            msg = (
+                "No nonzero values found in working dataframe. "
+                "Ensure that the dataframe contains valid data before applying IPFN."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+    except ValueError as err:
+        msg = (
+            f"Error while processing working_df: {err}. "
+            "This might be caused by an empty or incorrectly formatted dataframe "
+            "returned from fix_marginals."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
 
     cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
         type_total_label
@@ -426,16 +495,19 @@ def reconcile_data_with_marginals(
         index=[cohort_total_label], columns=[type_total_label]
     ).to_numpy()
 
+    # FIXME adjust behaviour to keep original data (trusted_values)
+
     arr_new = apply_ipfn(
         arr=arr_ini.copy(),
         aggregates=[cohort_marginals, type_marginals],
         dimensions=[[0], [1]],  # dimension over which the 'sum' is made
         convergence_rate=convergence_rate,
         max_iter=max_iter,
-    )
+    )  # FIXME: if there is only one value for ipfn (40, 0.1, 0.1, 0.1), everything should be alloted to the real value? now, 110 become (107, 2, 0, 0)...
+
     diff = (arr_new - arr_ini).round(decimals=2)
-    logger.info(f"Initial array before IPFN: {arr_ini.ravel()}")
-    logger.info(f"IPFN adjustment difference (rounded): {diff.ravel()}")
+    logger.debug(f"Initial array before IPFN: {arr_ini.ravel()}")
+    logger.debug(f"IPFN adjustment difference (rounded): {diff.ravel()}")
     logger.info(
         f"Sum of IPFN adjustment difference: {diff.sum().round(decimals=2)}"
     )  # NOTE: this should match the marginal adjustment
@@ -444,12 +516,11 @@ def reconcile_data_with_marginals(
     target_cols = [col for col in nonzeros.columns if col != type_total_label]
     nonzeros.loc[target_rows, target_cols] = (
         arr_new.round()
-    )  # FIXME, overwrite with a dataframe of target_rows, target_cols? REPRENDRE ICI
+    )  # FIXME, instead of modyfying rows and cols, overwrite with a dataframe of target_rows, target_cols?
 
     result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
-    display(result)
-    print(result.to_numpy().ravel())
-    print(diff.sum())
+    # display(result)
+
     return (
         result,
         diff,
@@ -458,74 +529,37 @@ def reconcile_data_with_marginals(
 
 if __name__ == "__main__":
     infile = "./data/clean/fulldata.parquet"
-    df, mask = interpolate(infile)
-    display(df)
-    display(df.info())
-    display(apply_rawdata_mask(df, mask))
+    data, mask = interpolate(infile)
+    display(data)
+    display(data.info())
+    display(
+        apply_rawdata_mask(data, mask)
+    )  # TODO use rawdata mask to check the modified values of raw data for quality control
+
+    groups = data.groupby(by=["census_year"])
+    for name, group in groups:
+        print(f"Group: {name}")
+
+        df = (
+            group.drop("census_year", axis=1)
+            .pivot(index=["vintage"], columns=["type"])
+            .droplevel(axis=1, level=0)
+        )  # droplevel removes 'dwellings' from the columns level: (dwellings, total) -> total
+
+        cols = [col for col in TARGET_TYPES if col in df]
+
+        result, diff = reconcile_data_with_marginals(df)
+        display(
+            df[cols] - result
+        )  # TODO compare masked and unmasked versions!! Should I protect the original data, or not? check copilot, and adjust reconcile.. function accordingly.
+
+        # display(group.pivot(index='vintage'))
 
 # TODO: look at the 'corrected' values, and at everything with "_fix" suffix
+# Realistically, as soon as I start changing the marginals, I can't only change the interpolated data.
 
-""" TODO implement this logic
-# If cond (the mask) is true (i.e., if there awas NaN in original dataframe, then overwrite the value with NaN. if not, keep original value.
-# https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.mask.html
+# TODO REPRENDRE consider adding the pre-1941 data (cs_data // old_cs_data), then run, and compare results to the initial dataset in a relplot (see previous to last cell in bac/dmfa_dataprep)
 
-res_fix = {}
-for year in new_csdw:
-    print(year)
-    # df = new_csdw[year]
-    # df, _ = fix_marginals(df)
-
-    # If cond (the mask) is true (i.e., if there awas NaN in original dataframe, then overwrite the value with NaN. if not, keep original value.
-    # https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.mask.html
-    df = new_csdw[year].copy().mask(new_csdw_mask[year].isna()).set_index("vintage")
-
-    # Identify cols with nans
-    target_cols = (df.isna().any(axis=0)).to_numpy()
-    print(target_cols, target_cols.any())
-
-    # Here there are two cases: 1) all cols are defined, 2) there are missing data in some cols. if there are no target cols, then simply run the fix_marginals on the original dataframe.
-    display(df)
-
-    if not target_cols.any():  # check if any cols is true
-        d, _ = fix_marginals(df)
-    else:
-        # Add 'total' to target columns for all cases
-        target_cols[0] = True
-
-        # get values from original, non-masked dataframe (i.e. the one containing backfilled interpolated values), but filtered on nan columns
-        aa = new_csdw[year].copy().set_index("vintage").loc[:, target_cols]
-        bb = new_csdw[year].copy().set_index("vintage").loc[:, ~target_cols]
-
-        # The totals are too high; must remove the known values
-        aa["total"] -= df.loc[:, ~(target_cols)].sum(axis=1)
-
-        # FIXME TEMP
-        display(aa)
-        display(bb)
-
-        # then find marginals
-        b, _ = fix_marginals(aa)
-        display(b)
-
-        cc = pd.concat([b, bb], axis=1).sort_index()
-        cc["total"] = cc.loc[:, "apartments":].sum(axis=1)
-
-        # test second pass  # FIXME
-        d, _ = fix_marginals(cc)
-        # display(d)
-        # print(d.iloc[1:,:].sum(axis=0).tolist())
-        # print(d.iloc[:,1:].sum(axis=1).tolist())
-
-    res_fix[year] = d[["total"] + agg_types]
-
-    # Check for errors
-    if year in [1991, 1996]:
-        display(df)
-        display(aa)
-        display(bb)
-        display(res_fix[year])
-"""
-# TODO import old_cs_data // cs_data, including update for paper 3 (update_ppd)
 
 """ TODO plot the data, and compare with initial parquet dataset. maybe save figures? use a notebook to demonstrate the workflow, print the figures?
 sns.relplot(
