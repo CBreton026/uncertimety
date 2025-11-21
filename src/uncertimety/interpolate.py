@@ -4,7 +4,7 @@ import numpy as np
 from operator import itemgetter
 from ipfn import ipfn
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from uncertimety.logger import init_logger
 from uncertimety.dataprep import load_dataset_config, sort_vintage_labels
 from IPython.display import display  # FIXME only for dev and tests
@@ -36,14 +36,43 @@ except KeyError as err:
 def interpolate(infile):
     df = pd.read_parquet(infile)
 
-    raw_mask = get_rawdata_mask(df)
+    # Check input data
+    required_columns = ["census_year", "type", "vintage", "dwellings"]
+
+    # Validate input DataFrame  # TODO convert to try-except block
+    if df.empty:
+        msg = f"Input dataframe is empty."
+        logger.error(msg)
+        raise ValueError(msg)
+
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        msg = f"DataFrame is missing required columns: {missing_columns}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    # Create a snapshot of original data for restoration; retrieve mask for later transforms
+    key_cols = ["census_year", "vintage", "type"]
+    snapshot, dataset = mark_original_data(df, key_cols=key_cols, value_col="dwellings")
 
     # Fill missing values using interpolation
-    interpolated = fill_missing_dwellings(df)
+    interpolated = fill_missing_dwellings(dataset)
+
+    # TODO REPRENDRE! NOW I NEED TO APPLY THE FIX MARGINALS and IPFN, WHICH BOTH RELY ON RECONCILE DATA WITH MARGINALS - MAKE SURE IT WORKS WITH THE IS-ORIG FLAG
+
+    # NOTE: check if the following is useful
+    # After transforms that may have reindexed/pivoted/aggregated, reapply original values
+    # Restore by key columns — vectorized, safe after grouping/pivot/unpivot (works if keys exist in transformed)
+    # try:
+    #     interpolated_restored = restore_original_data(interpolated, orig_snapshot, key_cols=key_cols, value_col="dwellings")
+    # except ValueError as err:
+    #     # If keys are missing in the transformed result, log and raise so caller can examine the layout
+    #     logger.error(f"Could not restore original values: {err}")
+    #     raise
 
     # run check_marginals (from dataprep) or a similar function to verify that the marginals are either the same, or closer than they were, after the fill_missing_values
 
-    return interpolated, raw_mask
+    return interpolated  # , raw_mask
 
 
 def apply_rawdata_mask(
@@ -67,49 +96,97 @@ def apply_rawdata_mask(
     return rawdata_df.where(mask)
 
 
-def get_rawdata_mask(
-    df: pd.DataFrame, by: list[str] = ["census_year", "vintage", "type"]
-):
+def mark_original_data(
+    df: pd.DataFrame, value_col: str = "dwellings"
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute a boolean mask for the raw data based on non-NaN aggregations.
-
-    This function groups the input DataFrame by the specified columns,
-    sums the numeric data with a minimum count of 1 (so that if all values are NaN, the result remains NaN), resets the index, and then returns a boolean DataFrame, indicating which values contain data (i.e., are not nans)
+    Mark original (non-NaN) data points to preserve them during interpolation.
 
     Args:
-        df: A pandas DataFrame containing the raw data.
-        by: A list of column names to group by. Defaults to ['census_year', 'vintage', 'type'].
+        df: DataFrame with data to mark
+        value_col: Column containing values to check for NaN
 
     Returns:
-        A pandas DataFrame of booleans with the same shape as the reset grouped DataFrame,
-        where each True value indicates that the corresponding aggregated value is not NaN.
-
-    Examples:
-        >>> data = {'census_year': [2001, 2001, 2011],
-        ...         'vintage': ['1608-2025', '1608-2025', '1608-1920'],
-        ...         'type': ['total', 'apartments', 'total'],
-        ...         'dwellings': [1000, None, 800]}
-        >>> df = pd.DataFrame(data)
-        >>> get_rawdata_mask(df)
-             census_year vintage      type  dwellings
-        0         2001  1608-2025     total       True
-        1         2001  1608-2025  apartments      False
-        2         2011  1608-1920     total       True
+        Tuple of (snapshot_df, marked_df) where:
+            - snapshot_df: DataFrame showing which values were originally present
+            - marked_df: Original DataFrame with additional 'is_orig' column
     """
-    mask = df.groupby(by).sum(min_count=1).reset_index().notna()
-    return mask
+    # Create the mask based on non-NaN values in the value column
+    is_original = df[value_col].notna()
+
+    # Create snapshot showing original data availability
+    snapshot = df.copy()
+    snapshot["is_orig"] = is_original
+
+    # Add is_orig column to the main dataframe
+    df_marked = df.copy()
+    df_marked["is_orig"] = is_original
+
+    return snapshot, df_marked
 
 
-def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
+def restore_original_data(
+    transformed: pd.DataFrame,
+    orig_snapshot: pd.DataFrame,
+    key_cols=None,
+    value_col: str = "dwellings",
+):
     """
-    Fill missing dwelling values using backward fill within each (type, vintage) group.
+    Reapply original values from orig_snapshot into transformed by key columns.
+    Uses a left merge + combine_first so it works even after group/pivot/indices changes.
+    """
+    if key_cols is None:
+        key_cols = ["census_year", "vintage", "type"]
+    # Ensure keys exist in both frames
+    missing = [
+        k
+        for k in key_cols
+        if k not in transformed.columns or k not in orig_snapshot.columns
+    ]
+    if missing:
+        raise ValueError(f"Missing key columns for restore: {missing}")
+
+    # FIXME instead of restoring, maybe only check/validate if orig data was preserved
+    merged = transformed.merge(
+        orig_snapshot, on=key_cols, how="left", suffixes=("", "_orig")
+    )
+    merged[value_col] = merged[f"{value_col}_orig"].combine_first(merged[value_col])
+    merged.drop(
+        columns=[c for c in merged.columns if c.endswith("_orig")], inplace=True
+    )
+    return merged
+
+
+def fill_missing_dwellings(
+    df: pd.DataFrame,
+    threshold: int = 10,
+    last_year: int = 2025,
+    value_col: str = "dwellings",
+) -> pd.DataFrame:
+    """
+    Fill missing dwelling values using using a combined approach - first backfill years outside cohort; then interpolate within cohort, knowing that there must be zero before cohort start
 
     This function fills NaN values in the 'dwellings' column by looking at future values within the same type and vintage group and propagating them backward.
 
     This sets the minimal dwelling count that must have been built earlier, knowing this dwelling count (by type and vintage) was observed in later censuses.
 
+    The name and groups are, e.g.,:
+        ('1608-1920', 'apartments')
+            census_year    vintage        type  dwellings
+
+        1357         1981  1608-1920  apartments        NaN
+        1338         1986  1608-1920  apartments        NaN
+        1169         1991  1608-1920  apartments        NaN
+        950          1996  1608-1920  apartments        NaN
+        681          2001  1608-1920  apartments        NaN
+        662          2006  1608-1920  apartments    98660.0
+        453          2011  1608-1920  apartments   100085.0
+        322          2016  1608-1920  apartments    98850.0
+        125          2021  1608-1920  apartments   108425.0
+
+
     Args:
-        df: DataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns
+        df: Tidy dataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns
 
     Returns:
         DataFrame with NaN values in 'dwellings' filled using backward fill
@@ -125,37 +202,49 @@ def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
         >>> filled['dwellings'].isna().sum()
         0
     """
-    # FIXME may break if passed an empty df
-    # Validate input DataFrame
-    required_columns = ["census_year", "type", "vintage", "dwellings"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"DataFrame is missing required columns: {missing_columns}")
-
     # Group by type and vintage
-    groups = df.groupby(["type", "vintage"])
+    groups = df.copy().sort_values("census_year").groupby(["vintage", "type"])
 
     # Process each group
     filled_groups = []
     for name, group in groups:
-        display(group.head(5))  # FIXME remove
-        filled_group = group.copy()
+        vintage_label, type_label = [label for label in name]
+        vintage_start, vintage_end = [int(yr) for yr in name[0].split("-")]
+        # ini_df = group.copy()
 
-        # TODO FIXME REPRENDRE - here one issue is that since I backfill everything, there may be some categories e.g., single_attached, for which the only available data is very recent; imagine for single_detached, older values were available; then, bfill would project *wrong* values backwards, and would shift the typesplit. I might have to do the 'totals' first, since I have the most data; then do a fix marginals; then bfill? However, doing that would ALSO shift the typesplit. should the bfill interpolation be limited to a given number of sequntial nans? or should I use a combination of ffill/bfill?
+        # reindex df over full range of census years
+        itp_df = group.copy().set_index("census_year")
+        initial_idx = itp_df.index  # save initial idx with select years; FIXME maybe relevant to instead keep all years?
 
-        # Apply backward fill on the dwellings column
-        filled_group["dwellings"] = filled_group["dwellings"].bfill()
-        # FIXME REPRENDRE the backfill is way too high for older data, i.e., data before 19XX. thus, use two passes -- see unfm_fix [ Finalized dataset, 1851-2021]
+        itp_df = itp_df.reindex(
+            range(vintage_start - 1, last_year + 1)
+        )  # NOTE if we use a threshold here, it prevents us from treating cases where the next available data is way after. we should use full period here
 
-        # print(filled_group["dwellings"].iloc[-1])  # FIXME logging
+        # now, backfill for stable/declining stocks, including the vintage_end value
+        mask = itp_df.index.to_series().ge(
+            vintage_end
+        )  # or, mask = itp_df.index >= vintage_end
+        itp_df.loc[mask, value_col] = itp_df.loc[mask, value_col].bfill()
 
-        if math.isnan(filled_group["dwellings"].iloc[-1]):
-            # Edge case where the last value of a group was a nan, leading to unfilled values
-            filled_group["dwellings"] = filled_group[
-                "dwellings"
-            ].ffill()  # NOTE-perhaps add a limit? can this cause issues in other datasets?
+        # using vintage_end value as max dwellings, and knowing that there were no dwellings the year before, we can do a linear interpolation
+        itp_df.loc[vintage_start - 1, "dwellings"] = 0
 
-        filled_groups.append(filled_group)
+        itp_df["dwellings"] = (
+            itp_df["dwellings"].interpolate(method="index").apply(lambda x: np.ceil(x))
+        )  # NOTE: here, I round up to remove decimal fractions of dwellings. this could/should be vectorized
+        itp_df["vintage"] = vintage_label  # e.g., '1608-1920'
+        itp_df["type"] = type_label  # e.g., 'apartments'
+
+        # Return the index to 'normal'
+        itp_df = itp_df.reindex(initial_idx)
+
+        # Overwrite NaNs in ini_df from linear interpolation results. This only overwrites NaNs, and should thus ensure that no original data is overwritten
+        group_res = (
+            group.copy().set_index("census_year").combine_first(itp_df).reset_index()
+        )
+
+        # retrieve results
+        filled_groups.append(group_res)
 
     # Combine all processed groups
     result = pd.concat(filled_groups)
@@ -164,6 +253,38 @@ def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
         msg = "Some NaN values remain after filling. Check the input data for completeness."
         logger.warning(msg)
         raise ValueError(msg)
+
+    return result
+
+
+def todo_marginals(df: pd.DataFrame):
+    working_df = df.copy()
+    census_years = working_df["census_years"].unique().tolist()
+
+    # Fix the marginals
+    ipfn_df = {}
+    for year in census_years:
+        logger.info(f" === Census {year} === ")
+        # Take individual census_year
+        tsplit = (
+            working_df.set_index("census_year")
+            .loc[year, :]
+            .pivot(index="vintage", columns="type", values="dwellings")
+            .reset_index()
+        )
+        # FIXME | REPRENDRE : THE ORIGINAL DATA MUST BE PROTECTED HERE TOO; I CANT DO ANYTHING TO THE MARGINALS THEMSELVE, AS I ALWAYS HAVE THE DATA. HOWEVER, I SHOULD USE THE SAME BEHAVIOR AS IN "PROTECTING DATA IN IPFN" TO PROTECT ORIGINAL DATA FROM BEING OVERWRITTEN
+        # NOTE - I think this will be done automatically throug reconcile_data_wth_marginals
+        new_data, diff = reconcile_data_with_marginals(tsplit)  # HERE pass mask!
+
+        ipfn_df[year] = new_data
+        # NOTE diff can be useful for documentation; maybe check max/min value to see largest diff?
+
+    result = (
+        pd.concat(ipfn_df)
+        .stack("type")
+        .reset_index()
+        .rename(columns={"level_0": "census_year", 0: "dwellings"})
+    )
 
     return result
 
@@ -249,6 +370,7 @@ def fix_marginals(
     dw_types: list[str] = TARGET_TYPES,
     type_total_label: str = "total",
     cohort_total_label: str = "1608-2025",
+    protect_original: pd.DataFrame = None,  # pass mask if some data must be protected
 ) -> pd.DataFrame:
     """
     Adjust the marginals (row and column totals) in the input DataFrame
@@ -292,41 +414,98 @@ def fix_marginals(
     ]
     working_df = working_df.loc[:, cols_to_keep].astype("float")
 
-    # FIXME: this function does too much at once, everything above here might best be relegated to the reconcile_data_with_marginals function?
+    # Set default desired sum
+    if (
+        desired_sum is None
+    ):  # allows to set arbitrary  if needed; defaults to existing 'total'
+        desired_sum = working_df.loc[cohort_total_label, type_total_label]
+
+    # Set default type and cohort totals to desired_sum
+    type_total = desired_sum
+    cohort_total = desired_sum
 
     # Only keep nonzero values; there can be no 'zero' values for the IPFN procedure; small (i.e. close to zero) values must be set to arbitrary small values (e.g., orders of magnitude smaller than actual data) beforehand
     # this method first converts values where condition is false to nans, then drop the nan rows
-    nonzeros = working_df.where(working_df > 0).dropna()
-    zeros = working_df.where(working_df == 0).dropna()
+    # NOTE: throws an error if there are zeros in the 1608-2025 row! I must protect original data here too. Otherwise, when looking for cohort total label, it throws an error. this was an initial solution for the case where  I had (interpolated) data everywhere, except lines filled with zeros.
 
-    # Extract current marginals
-    try:
-        if desired_sum is None:  # allows to set arbitrary desired_sums
-            desired_sum = nonzeros.loc[cohort_total_label, type_total_label]
+    # FIX: first, remove the 'True' data in marginals - here, we're only interested by marginals
+    known_cohort_marginals = None
+    known_type_marginals = None
+    zeros=None # FIXME for legacy behaviour; might just relaunch with a default mask if no mask is passed. E.g., if no mask, then 'protect' rows with all zeroes.
 
-        cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
-            type_total_label
-        ].to_numpy()
-        type_marginals = (
-            nonzeros.drop(type_total_label, axis=1)
-            .loc[cohort_total_label, :]
-            .to_numpy()
+    if not protect_original.empty:
+        # FIXME REPRENDRE: make sure that the rows full of 'zeros' are automatically true in mask? this way, I don't have to worry about them. check it works properly
+        # grab known original data
+        known_type_marginals = working_df[protect_original].loc[cohort_total_label, :]
+        known_cohort_marginals = working_df[protect_original].loc[:, type_total_label]
+
+        # adjust desired sum for type and cohorts and
+        type_total -= known_type_marginals.sum()
+        cohort_total -= known_cohort_marginals.sum()
+
+        # prepare vectors to be modified
+        cohort_marginals = (
+            working_df.loc[known_cohort_marginals.isna(), :]
+            # working_df.loc[:, type_total_label]
+            # .sub(known_cohort_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values NOTE: no need to subtract - i must simply remove the value. Else, it's gonna be treated as a small modifiable value.
+            # .drop(cohort_total_label) # FIXME REPRENDRE which one to remove? I'm confused
+            .replace(0, 0.1)  # replace zero values
         )
-    except KeyError as err:
-        logger.error(f"Missing expected label in DataFrame: {err}")
-        raise
+
+        type_marginals = (
+            working_df.loc[:, known_type_marginals.isna()]
+            # working_df.loc[cohort_total_label, :]
+            # .sub(known_type_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values
+            # .drop(type_total_label, axis=1) # FIXME REPRENDRE which one to remove? I'm confused
+            .replace(0, 0.1)  # replace zero values
+        )
+
+    else:
+        # legacy code?
+        # keep rows where everything is zero separate
+        zeros = working_df.where(working_df == 0).dropna()
+        nonzeros = working_df.where(working_df != 0).dropna(how="all")
+
+        working_df = working_df.replace(0, 0.1)
+
+        # Extract current marginals
+        try:
+            cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
+                type_total_label
+            ]  # cohort_total_label == 1608-2025
+            type_marginals = nonzeros.drop(type_total_label, axis=1).loc[
+                cohort_total_label, :
+            ]  # type_total_label == 'total'
+        except KeyError as err:
+            logger.error(f"Missing expected label in DataFrame: {err}")
+            raise
+
+    print(type_marginals)
+    print(cohort_marginals)
 
     # Adjust marginals using Largest Remainder Method
-    adj_type_marginals = round_consistent_sum(type_marginals, desired_sum)
-    adj_cohort_marginals = round_consistent_sum(cohort_marginals, desired_sum)
+    adj_type_marginals = round_consistent_sum(type_marginals.to_numpy(), type_total)
+    adj_cohort_marginals = round_consistent_sum(
+        cohort_marginals.to_numpy(), cohort_total
+    )
 
-    # Identify target indexes and columns
-    rows = nonzeros.index[nonzeros.index != cohort_total_label]
-    cols = [col for col in nonzeros.columns if col != type_total_label]
+    print(adj_type_marginals)
+    print(adj_cohort_marginals)
 
     # Log the modifications  # TODO also return them, e.g, through a dataclass?
-    type_diff = adj_type_marginals - type_marginals
-    cohort_diff = adj_cohort_marginals - cohort_marginals
+    type_diff = adj_type_marginals - type_marginals.to_numpy()
+    cohort_diff = adj_cohort_marginals - cohort_marginals.to_numpy()
+
+    # Identify target indexes and columns
+    if known_type_marginals or known_cohort_marginals:
+        rows = cohort_marginals.index[cohort_marginals.index != cohort_total_label]
+        cols = [col for col in type_marginals.columns if col != type_total_label]
+    else:
+        rows = nonzeros.index[nonzeros.index != cohort_total_label]
+        cols = [col for col in nonzeros.columns if col != type_total_label]
+
+    print(rows)
+    print(cols)
 
     if type_diff.sum() + cohort_diff.sum() == 0:
         logger.info("Marginals fit; no modifications required.")
@@ -343,16 +522,19 @@ def fix_marginals(
 
     # Assign results to DataFrame
     # For the type totals: assign to all rows except the cohort total row.
-    nonzeros.loc[rows, type_total_label] = pd.Series(adj_cohort_marginals, index=rows)
+    working_df.loc[rows, type_total_label] = pd.Series(adj_cohort_marginals, index=rows)
 
     # For the cohort total: assign to all columns except the type_total column.
-    nonzeros.loc[cohort_total_label, cols] = pd.Series(adj_type_marginals, index=cols)
+    working_df.loc[cohort_total_label, cols] = pd.Series(adj_type_marginals, index=cols)
 
     # For the desired_sum value
-    nonzeros.loc[cohort_total_label, type_total_label] = desired_sum
+    working_df.loc[cohort_total_label, type_total_label] = desired_sum
 
-    # Concat nonzeros and zero data
-    result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
+    if zeros:
+        # Concat nonzeros and zero data
+        result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
+    else: 
+        result=working_df
 
     # col_order = ["total"] + sorted(dw_types)
     return result
@@ -439,8 +621,6 @@ def reconcile_data_with_marginals(
 
     # add option to protect initial data
     if protect_original is not None:
-        protected = None
-        unprotected = None
         working_df = fix_marginals(
             working_df,
             desired_sum=desired_sum,
@@ -462,7 +642,6 @@ def reconcile_data_with_marginals(
             type_total_label=type_total_label,
             cohort_total_label=cohort_total_label,
         )  # FIXME: this can return dataframes with zeroes, which can lead to issues in the IPFN. For now, kept for legacy tests; this might need to be corrected, like in the case where protect_original is passed a mask.
-    print(working_df)  # TODO delete
 
     # then, apply_ipfn
     try:
