@@ -431,9 +431,9 @@ def fix_marginals(
     # FIX: first, remove the 'True' data in marginals - here, we're only interested by marginals
     known_cohort_marginals = None
     known_type_marginals = None
-    zeros=None # FIXME for legacy behaviour; might just relaunch with a default mask if no mask is passed. E.g., if no mask, then 'protect' rows with all zeroes.
+    zeros = None # FIXME for legacy behaviour; might just relaunch with a default mask if no mask is passed. E.g., if no mask, then 'protect' rows with all zeroes.
 
-    if not protect_original.empty:
+    if isinstance(protect_original, pd.DataFrame) and not protect_original.empty:
         # FIXME REPRENDRE: make sure that the rows full of 'zeros' are automatically true in mask? this way, I don't have to worry about them. check it works properly
         # grab known original data
         known_type_marginals = working_df[protect_original].loc[cohort_total_label, :]
@@ -448,7 +448,7 @@ def fix_marginals(
             working_df.loc[known_cohort_marginals.isna(), :]
             # working_df.loc[:, type_total_label]
             # .sub(known_cohort_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values NOTE: no need to subtract - i must simply remove the value. Else, it's gonna be treated as a small modifiable value.
-            # .drop(cohort_total_label) # FIXME REPRENDRE which one to remove? I'm confused
+            .drop(cohort_total_label)
             .replace(0, 0.1)  # replace zero values
         )
 
@@ -456,7 +456,7 @@ def fix_marginals(
             working_df.loc[:, known_type_marginals.isna()]
             # working_df.loc[cohort_total_label, :]
             # .sub(known_type_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values
-            # .drop(type_total_label, axis=1) # FIXME REPRENDRE which one to remove? I'm confused
+            .drop(type_total_label, axis=1)
             .replace(0, 0.1)  # replace zero values
         )
 
@@ -480,24 +480,39 @@ def fix_marginals(
             logger.error(f"Missing expected label in DataFrame: {err}")
             raise
 
-    print(type_marginals)
-    print(cohort_marginals)
+    print(f"Type marginals: \n{type_marginals.loc[cohort_total_label,:]}")
+    print(f"Cohort_marginals: \n{cohort_marginals.loc[:, type_total_label]}")
+    # NOTE: here, the balance of the rows and cols MUST be *at least* the value of the protected data (assuming the mask is correct - perhaps raise a warning here, just to make sure that any such modifications are wanted)
+    print(f"known types: \n{working_df.loc[known_cohort_marginals.notna(),type_marginals.columns].sum()}, exp. total: {type_total}")    
+    print(f"known cohorts: \n{working_df.loc[cohort_marginals.index, known_type_marginals.notna()].sum(axis=1)}, exp. total: {cohort_total}")
+    # FIXME need to extract only the correct data, now the filter doesn't work properly. should extract 3 type marginals but also extract the 
 
-    # Adjust marginals using Largest Remainder Method
-    adj_type_marginals = round_consistent_sum(type_marginals.to_numpy(), type_total)
-    adj_cohort_marginals = round_consistent_sum(
-        cohort_marginals.to_numpy(), cohort_total
+    # FIXME REPRENDRE. here we use maximum; if the column maximum is higher than the sum of known values, nothing changes. For instance, in my example, if mobile type marginal is 120, it's not 'updated' by having known values of 80. However, if it's smaller (e.g., for 1608-1920, 0 when sum is 20, then the value is updated. )
+    updated_type_marginals = np.maximum(
+        type_marginals.loc[cohort_total_label,:].to_numpy(),
+        working_df.loc[known_cohort_marginals.notna(),type_marginals.columns].sum().to_numpy(),
     )
 
-    print(adj_type_marginals)
-    print(adj_cohort_marginals)
+    updated_cohort_marginals = np.maximum(
+        cohort_marginals.loc[:, type_total_label].to_numpy(),
+       working_df.loc[cohort_marginals.index, known_type_marginals.notna()].sum(axis=1).to_numpy(),
+    )
+
+    # Adjust marginals using Largest Remainder Method
+    # adj_type_marginals = round_consistent_sum(type_marginals.loc[cohort_total_label,:].to_numpy(), type_total)
+    adj_type_marginals = round_consistent_sum(updated_type_marginals, type_total)
+    # adj_cohort_marginals = round_consistent_sum(cohort_marginals.loc[:, type_total_label].to_numpy(), cohort_total)
+    adj_cohort_marginals= round_consistent_sum(updated_cohort_marginals, cohort_total)
+
+    print(f"Adjusted type marginals: {adj_type_marginals}")
+    print(f"Adjusted cohort marginals: {adj_cohort_marginals}")
 
     # Log the modifications  # TODO also return them, e.g, through a dataclass?
-    type_diff = adj_type_marginals - type_marginals.to_numpy()
-    cohort_diff = adj_cohort_marginals - cohort_marginals.to_numpy()
+    type_diff = adj_type_marginals - type_marginals.loc[cohort_total_label,:].to_numpy()
+    cohort_diff = adj_cohort_marginals - cohort_marginals.loc[:, type_total_label].to_numpy()
 
     # Identify target indexes and columns
-    if known_type_marginals or known_cohort_marginals:
+    if not known_type_marginals.empty or not known_cohort_marginals.empty:
         rows = cohort_marginals.index[cohort_marginals.index != cohort_total_label]
         cols = [col for col in type_marginals.columns if col != type_total_label]
     else:
@@ -507,18 +522,19 @@ def fix_marginals(
     print(rows)
     print(cols)
 
-    if type_diff.sum() + cohort_diff.sum() == 0:
-        logger.info("Marginals fit; no modifications required.")
-    else:
-        if sum(type_diff) != 0:
-            logger.info(
-                f"Modified type marginals: {sum(type_diff)} units ({type_diff}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
-            )
+    # FIXME REDO logging and/or this check
+    # if type_diff.sum() + cohort_diff.sum() == 0:
+    #     logger.info("Marginals fit; no modifications required.")
+    # else:
+    #     if sum(type_diff) != 0:
+    #         logger.info(
+    #             f"Modified type marginals: {sum(type_diff)} units ({type_diff}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
+    #         )
 
-        if sum(cohort_diff) != 0:
-            logger.info(
-                f"Modified cohort marginals: {sum(cohort_diff)} units ({cohort_diff}) from {nonzeros.loc[rows, type_total_label].to_json()}"
-            )
+    #     if sum(cohort_diff) != 0:
+    #         logger.info(
+    #             f"Modified cohort marginals: {sum(cohort_diff)} units ({cohort_diff}) from {nonzeros.loc[rows, type_total_label].to_json()}"
+    #         )
 
     # Assign results to DataFrame
     # For the type totals: assign to all rows except the cohort total row.
@@ -530,11 +546,11 @@ def fix_marginals(
     # For the desired_sum value
     working_df.loc[cohort_total_label, type_total_label] = desired_sum
 
-    if zeros:
+    if isinstance(zeros, pd.DataFrame) and not zeros.empty:
         # Concat nonzeros and zero data
         result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
     else: 
-        result=working_df
+        result = working_df
 
     # col_order = ["total"] + sorted(dw_types)
     return result
@@ -628,10 +644,11 @@ def reconcile_data_with_marginals(
             dw_types=dw_types,
             type_total_label=type_total_label,
             cohort_total_label=cohort_total_label,
+            protect_original=protect_original,
         )
         working_df = working_df.replace(
             0, 0.1
-        )  # FIXME; here, replacing all zeros doesn't work, I need to replace only 'Nan' zeros, and zeros in totals
+        )  # FIXME; here, replacing all zeros doesn't work, I need to replace only 'Nan' zeros, and zeros in totals. Maybe not needed after changes in fix_marginals
     else:
         # first, fix_marginals
         working_df = fix_marginals(
@@ -673,6 +690,9 @@ def reconcile_data_with_marginals(
     arr_ini = nonzeros.drop(
         index=[cohort_total_label], columns=[type_total_label]
     ).to_numpy()
+
+    # Protect original data
+    print(f"arr ini: \n{arr_ini}")
 
     # FIXME adjust behaviour to keep original data (trusted_values)
 
