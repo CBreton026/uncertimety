@@ -4,9 +4,10 @@ import numpy as np
 from operator import itemgetter
 from ipfn import ipfn
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional, Tuple
 from uncertimety.logger import init_logger
-from uncertimety.dataprep import load_dataset_config, sort_vintage_labels
+from uncertimety.dataprep import load_dataset_config
 from IPython.display import display  # FIXME only for dev and tests
 
 
@@ -32,7 +33,236 @@ except KeyError as err:
     logger.error(f"Missing expected key in config file {CONFIG}: {err}")
     raise
 
+# ==== Helper methods for fix_marginals and IPFN procedure ====
+# Constants  # FIXME maybe remove or load from config
+COHORT_TOTAL_LABEL = "1608-2025"
+TYPE_TOTAL_LABEL = "total"
+DEFAULT_ATOL = 5.0
+DEFAULT_RTOL = 1e-5
+VINTAGE_COL = "vintage"
+ZERO_REPLACEMENT = 0.1
 
+
+@dataclass
+class MarginalAdjustment:
+    """Container for marginal adjustment results."""
+
+    adjusted_df: pd.DataFrame
+    type_diff: np.ndarray
+    cohort_diff: np.ndarray
+    type_marginals: pd.Series
+    cohort_marginals: pd.Series
+    protected_type_sum: float
+    protected_cohort_sum: float
+
+    def total_adjustment(self) -> float:
+        """Calculate total adjustment magnitude."""
+        return np.abs(self.type_diff).sum() + np.abs(self.cohort_diff).sum()
+
+
+@dataclass
+class IPFNResult:
+    """Container for IPFN reconciliation results."""
+
+    result: pd.DataFrame
+    difference: np.ndarray
+    convergence_achieved: bool
+    iterations: int
+
+    def max_adjustment(self) -> float:
+        """Get maximum adjustment value."""
+        return np.abs(self.difference).max()
+
+
+class DataProtector:
+    """Handles data protection logic for marginal adjustments."""
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        mask: Optional[pd.DataFrame] = None,
+        cohort_label: str = COHORT_TOTAL_LABEL,
+        type_label: str = TYPE_TOTAL_LABEL,
+    ):
+        """
+        Initialize data protector.
+
+        Args:
+            df: DataFrame to protect
+            mask: Boolean mask indicating which values are original/protected
+            cohort_label: Label for cohort total row
+            type_label: Label for type total column
+        """
+        self.df = df
+        self.cohort_label = cohort_label
+        self.type_label = type_label
+
+        # Default to no protection if mask not provided
+        if mask is None:
+            mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+        self.mask = mask
+
+    def get_protected_marginals(self) -> Tuple[pd.Series, pd.Series]:
+        """
+        Extract protected marginal values.
+
+        Returns:
+            Tuple of (protected_type_marginals, protected_cohort_marginals)
+        """
+        protected_types = self.df[self.mask].loc[self.cohort_label, :]
+        protected_cohorts = self.df[self.mask].loc[:, self.type_label]
+
+        return protected_types, protected_cohorts
+
+    def get_protected_sums(self) -> Tuple[float, float]:
+        """
+        Calculate sums of protected values.
+
+        Returns:
+            Tuple of (protected_type_sum, protected_cohort_sum)
+        """
+        protected_types, protected_cohorts = self.get_protected_marginals()
+        return protected_types.sum(), protected_cohorts.sum()
+
+    def get_modifiable_indices(self) -> Tuple[pd.Index, pd.Index]:
+        """
+        Get indices of rows and columns that can be modified.
+
+        Returns:
+            Tuple of (modifiable_rows, modifiable_columns)
+        """
+        protected_types, protected_cohorts = self.get_protected_marginals()
+
+        modifiable_rows = self.df.loc[protected_cohorts.isna(), :].index
+        modifiable_cols = self.df.loc[:, protected_types.isna()].columns
+
+        # Exclude total labels
+        modifiable_rows = modifiable_rows[modifiable_rows != self.cohort_label]
+        modifiable_cols = modifiable_cols[modifiable_cols != self.type_label]
+
+        return modifiable_rows, modifiable_cols
+
+    def calculate_adjusted_targets(self, desired_sum: float) -> Tuple[float, float]:
+        """
+        Calculate target sums after accounting for protected values.
+
+        Args:
+            desired_sum: Total desired sum
+
+        Returns:
+            Tuple of (adjusted_type_total, adjusted_cohort_total)
+        """
+        protected_type_sum, protected_cohort_sum = self.get_protected_sums()
+
+        type_total = desired_sum - protected_type_sum
+        cohort_total = desired_sum - protected_cohort_sum
+
+        return type_total, cohort_total
+
+    def validate_desired_sum(
+        self, desired_sum: float, atol: float = DEFAULT_ATOL, rtol: float = DEFAULT_RTOL
+    ) -> Tuple[bool, str]:
+        """
+        Validate that desired_sum is compatible with protected data.
+
+        Args:
+            desired_sum: Target sum to validate
+            atol: Absolute tolerance
+            rtol: Relative tolerance
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        protected_type_sum, protected_cohort_sum = self.get_protected_sums()
+
+        # Check type marginals
+        if protected_type_sum > desired_sum:
+            diff = protected_type_sum - desired_sum
+            if not np.isclose(protected_type_sum, desired_sum, atol=atol, rtol=rtol):
+                msg = (
+                    f"Protected type marginals sum ({protected_type_sum:.2f}) "
+                    f"exceeds desired_sum ({desired_sum:.2f}) by {diff:.2f}. "
+                    f"Cannot reconcile without modifying protected data."
+                )
+                return False, msg
+
+        # Check cohort marginals
+        if protected_cohort_sum > desired_sum:
+            diff = protected_cohort_sum - desired_sum
+            if not np.isclose(protected_cohort_sum, desired_sum, atol=atol, rtol=rtol):
+                msg = (
+                    f"Protected cohort marginals sum ({protected_cohort_sum:.2f}) "
+                    f"exceeds desired_sum ({desired_sum:.2f}) by {diff:.2f}. "
+                    f"Cannot reconcile without modifying protected data."
+                )
+                return False, msg
+
+        return True, ""
+
+
+class MarginalExtractor:
+    """Extracts and prepares marginal data for adjustment."""
+
+    @staticmethod
+    def extract_marginals(
+        df: pd.DataFrame,
+        cohort_label: str = COHORT_TOTAL_LABEL,
+        type_label: str = TYPE_TOTAL_LABEL,
+        replace_zeros: bool = True,
+        zero_replacement: float = ZERO_REPLACEMENT,
+    ) -> Tuple[pd.Series, pd.Series]:
+        """
+        Extract type and cohort marginals from DataFrame.
+
+        Args:
+            df: Input DataFrame with marginals
+            cohort_label: Label for cohort total row
+            type_label: Label for type total column
+            replace_zeros: Whether to replace zeros with small value
+            zero_replacement: Value to replace zeros with
+
+        Returns:
+            Tuple of (type_marginals, cohort_marginals)
+        """
+        cohort_marginals = df.drop(cohort_label, axis=0)[type_label]
+        type_marginals = df.drop(type_label, axis=1).loc[cohort_label, :]
+
+        if replace_zeros:
+            cohort_marginals = cohort_marginals.replace(0, zero_replacement)
+            type_marginals = type_marginals.replace(0, zero_replacement)
+
+        return type_marginals, cohort_marginals
+
+    @staticmethod
+    def filter_columns(
+        df: pd.DataFrame,
+        dw_types: list,
+        type_label: str = TYPE_TOTAL_LABEL,
+        label_col: str = "vintage",
+    ) -> pd.DataFrame:
+        """
+        Filter DataFrame to relevant dwelling type columns.
+
+        Args:
+            df: Input DataFrame
+            dw_types: List of dwelling types to keep
+            type_label: Label for total column
+            label_col: Name of label column (e.g., 'vintage')
+
+        Returns:
+            Filtered DataFrame
+        """
+        if label_col in df.columns:
+            df = df.set_index(label_col)
+
+        cols_to_keep = [type_label] + [
+            col for col in sorted(dw_types) if col in df.columns and col != type_label
+        ]
+
+        return df.loc[:, cols_to_keep].astype(float)
+
+
+# ==== Main module code ====
 def interpolate(infile):
     df = pd.read_parquet(infile)
 
@@ -41,7 +271,7 @@ def interpolate(infile):
 
     # Validate input DataFrame  # TODO convert to try-except block
     if df.empty:
-        msg = f"Input dataframe is empty."
+        msg = "Input dataframe is empty."
         logger.error(msg)
         raise ValueError(msg)
 
@@ -157,36 +387,16 @@ def restore_original_data(
     return merged
 
 
-def fill_missing_dwellings(
-    df: pd.DataFrame,
-    threshold: int = 10,
-    last_year: int = 2025,
-    value_col: str = "dwellings",
-) -> pd.DataFrame:
+def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fill missing dwelling values using using a combined approach - first backfill years outside cohort; then interpolate within cohort, knowing that there must be zero before cohort start
+    Fill missing dwelling values using backward fill within each (type, vintage) group.
 
     This function fills NaN values in the 'dwellings' column by looking at future values within the same type and vintage group and propagating them backward.
 
     This sets the minimal dwelling count that must have been built earlier, knowing this dwelling count (by type and vintage) was observed in later censuses.
 
-    The name and groups are, e.g.,:
-        ('1608-1920', 'apartments')
-            census_year    vintage        type  dwellings
-
-        1357         1981  1608-1920  apartments        NaN
-        1338         1986  1608-1920  apartments        NaN
-        1169         1991  1608-1920  apartments        NaN
-        950          1996  1608-1920  apartments        NaN
-        681          2001  1608-1920  apartments        NaN
-        662          2006  1608-1920  apartments    98660.0
-        453          2011  1608-1920  apartments   100085.0
-        322          2016  1608-1920  apartments    98850.0
-        125          2021  1608-1920  apartments   108425.0
-
-
     Args:
-        df: Tidy dataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns
+        df: DataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns
 
     Returns:
         DataFrame with NaN values in 'dwellings' filled using backward fill
@@ -202,49 +412,37 @@ def fill_missing_dwellings(
         >>> filled['dwellings'].isna().sum()
         0
     """
+    # FIXME may break if passed an empty df
+    # Validate input DataFrame
+    required_columns = ["census_year", "type", "vintage", "dwellings"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"DataFrame is missing required columns: {missing_columns}")
+
     # Group by type and vintage
-    groups = df.copy().sort_values("census_year").groupby(["vintage", "type"])
+    groups = df.groupby(["type", "vintage"])
 
     # Process each group
     filled_groups = []
     for name, group in groups:
-        vintage_label, type_label = [label for label in name]
-        vintage_start, vintage_end = [int(yr) for yr in name[0].split("-")]
-        # ini_df = group.copy()
+        display(group.head(5))  # FIXME remove
+        filled_group = group.copy()
 
-        # reindex df over full range of census years
-        itp_df = group.copy().set_index("census_year")
-        initial_idx = itp_df.index  # save initial idx with select years; FIXME maybe relevant to instead keep all years?
+        # TODO FIXME REPRENDRE - here one issue is that since I backfill everything, there may be some categories e.g., single_attached, for which the only available data is very recent; imagine for single_detached, older values were available; then, bfill would project *wrong* values backwards, and would shift the typesplit. I might have to do the 'totals' first, since I have the most data; then do a fix marginals; then bfill? However, doing that would ALSO shift the typesplit. should the bfill interpolation be limited to a given number of sequntial nans? or should I use a combination of ffill/bfill?
 
-        itp_df = itp_df.reindex(
-            range(vintage_start - 1, last_year + 1)
-        )  # NOTE if we use a threshold here, it prevents us from treating cases where the next available data is way after. we should use full period here
+        # Apply backward fill on the dwellings column
+        filled_group["dwellings"] = filled_group["dwellings"].bfill()
+        # FIXME REPRENDRE the backfill is way too high for older data, i.e., data before 19XX. thus, use two passes -- see unfm_fix [ Finalized dataset, 1851-2021]
 
-        # now, backfill for stable/declining stocks, including the vintage_end value
-        mask = itp_df.index.to_series().ge(
-            vintage_end
-        )  # or, mask = itp_df.index >= vintage_end
-        itp_df.loc[mask, value_col] = itp_df.loc[mask, value_col].bfill()
+        # print(filled_group["dwellings"].iloc[-1])  # FIXME logging
 
-        # using vintage_end value as max dwellings, and knowing that there were no dwellings the year before, we can do a linear interpolation
-        itp_df.loc[vintage_start - 1, "dwellings"] = 0
+        if math.isnan(filled_group["dwellings"].iloc[-1]):
+            # Edge case where the last value of a group was a nan, leading to unfilled values
+            filled_group["dwellings"] = filled_group[
+                "dwellings"
+            ].ffill()  # NOTE-perhaps add a limit? can this cause issues in other datasets?
 
-        itp_df["dwellings"] = (
-            itp_df["dwellings"].interpolate(method="index").apply(lambda x: np.ceil(x))
-        )  # NOTE: here, I round up to remove decimal fractions of dwellings. this could/should be vectorized
-        itp_df["vintage"] = vintage_label  # e.g., '1608-1920'
-        itp_df["type"] = type_label  # e.g., 'apartments'
-
-        # Return the index to 'normal'
-        itp_df = itp_df.reindex(initial_idx)
-
-        # Overwrite NaNs in ini_df from linear interpolation results. This only overwrites NaNs, and should thus ensure that no original data is overwritten
-        group_res = (
-            group.copy().set_index("census_year").combine_first(itp_df).reset_index()
-        )
-
-        # retrieve results
-        filled_groups.append(group_res)
+        filled_groups.append(filled_group)
 
     # Combine all processed groups
     result = pd.concat(filled_groups)
@@ -365,206 +563,221 @@ def round_consistent_sum(arr, desired_sum):
 
 def fix_marginals(
     df: pd.DataFrame,
-    desired_sum=None,
-    label: str = "vintage",
+    desired_sum: Optional[int] = None,
+    label: str = VINTAGE_COL,
     dw_types: list[str] = TARGET_TYPES,
-    type_total_label: str = "total",
-    cohort_total_label: str = "1608-2025",
-    protect_original: pd.DataFrame = None,  # pass mask if some data must be protected
-) -> pd.DataFrame:
+    type_total_label: str = TYPE_TOTAL_LABEL,
+    cohort_total_label: str = COHORT_TOTAL_LABEL,
+    protect_original: Optional[pd.DataFrame] = None,
+    atol: float = DEFAULT_ATOL,
+    rtol: float = DEFAULT_RTOL,
+) -> MarginalAdjustment:
     """
-    Adjust the marginals (row and column totals) in the input DataFrame
-    using the Largest Remainder Method (via round_consistent_sum) so that
-    the component sums match the desired totals.
-
-    The input DataFrame is expected to have a row (indexed by `label`) that
-    serves as the cohort total (with label `cohort_total_label`) and a column
-    (named by `type_total_label`) that is the type total.
-
-    The function first restricts the DataFrame to the target dwelling type columns.
-    To ensure the overall total column isn’t dropped, this revision forces inclusion
-    of `type_total_label` within the filtered columns.
+    Adjust marginals using Largest Remainder Method while protecting original data.
 
     Args:
-        df (pd.DataFrame): DataFrame containing marginal data.
-        target: (unused) placeholder for potential future use.
-        label (str): The categorical column holding the index (e.g., 'vintage').
-        dw_types (list[str]): List of dwelling types to process. Assumes type_total_label is included in dw_types
-        type_total_label (str): Column name for the type total.
-        cohort_total_label (str): Row label for the cohort total.
+        df: Input DataFrame with marginals
+        desired_sum: Target total sum (defaults to existing total)
+        label: Column name for index labels
+        dw_types: List of dwelling types to process
+        type_total_label: Column name for type totals
+        cohort_total_label: Row label for cohort totals
+        protect_original: Boolean mask for protected values
+        atol: Absolute tolerance for validation
+        rtol: Relative tolerance for validation
 
     Returns:
-        pd.DataFrame: A DataFrame with adjusted marginals. The nonzero cells are adjusted
-        via the Largest Remainder Method, then the zeros are concatenated back.
+        MarginalAdjustment object with results
 
     Raises:
-        KeyError: If the expected labels are missing from the DataFrame.
+        ValueError: If desired_sum is incompatible with protected data
     """
-    # NOTE In the future, it might be relevant to first treat the target types, and then 'reverse-engineer' the subcategories
-    # Set index based on label if available.
-    if label in df.columns:
-        working_df = df.copy().set_index(label)
+    # Filter and prepare data
+    working_df = MarginalExtractor.filter_columns(df, dw_types, type_total_label, label)
+
+    # Set default desired sum and ensure it's an integer
+    if desired_sum is None:
+        desired_sum = int(working_df.loc[cohort_total_label, type_total_label])
     else:
-        working_df = df.copy()
+        desired_sum = int(desired_sum)
 
-    # Ensure we keep only the relevant columns, and convert dataset to float.
-    # Force inclusion of type_total_label even if not present in dw_types.
-    cols_to_keep = [type_total_label] + [
-        col for col in sorted(dw_types) if col in df.columns and col != type_total_label
-    ]
-    working_df = working_df.loc[:, cols_to_keep].astype("float")
-
-    # Set default desired sum
-    if (
-        desired_sum is None
-    ):  # allows to set arbitrary  if needed; defaults to existing 'total'
-        desired_sum = working_df.loc[cohort_total_label, type_total_label]
-
-    # Set default type and cohort totals to desired_sum
-    type_total = desired_sum
-    cohort_total = desired_sum
-
-    # Only keep nonzero values; there can be no 'zero' values for the IPFN procedure; small (i.e. close to zero) values must be set to arbitrary small values (e.g., orders of magnitude smaller than actual data) beforehand
-    # this method first converts values where condition is false to nans, then drop the nan rows
-    # NOTE: throws an error if there are zeros in the 1608-2025 row! I must protect original data here too. Otherwise, when looking for cohort total label, it throws an error. this was an initial solution for the case where  I had (interpolated) data everywhere, except lines filled with zeros.
-
-    zeros = None # FIXME for legacy behaviour; might just relaunch with a default mask if no mask is passed. E.g., if no mask, then 'protect' rows with all zeroes.
-
-    if isinstance(protect_original, pd.DataFrame) and not protect_original.empty and not np.all(protect_original==True):
-        # FIXME REPRENDRE: make sure that the rows full of 'zeros' are automatically true in mask? this way, I don't have to worry about them. check it works properly
-        # grab known original data
-        known_type_marginals = working_df[protect_original].loc[cohort_total_label, :]
-        known_cohort_marginals = working_df[protect_original].loc[:, type_total_label]
-
-        # adjust desired sum for type and cohorts and
-        type_total -= known_type_marginals.sum()
-        cohort_total -= known_cohort_marginals.sum()
-
-        # prepare vectors to be modified
-        try:
-            cohort_marginals = (
-                working_df.loc[known_cohort_marginals.isna(), :]
-                # working_df.loc[:, type_total_label]
-                # .sub(known_cohort_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values NOTE: no need to subtract - i must simply remove the value. Else, it's gonna be treated as a small modifiable value.
-                .drop(cohort_total_label)
-                .replace(0, 0.1)  # replace zero values
-            ).loc[:, type_total_label]
-
-        except KeyError as err:
-            msg = f"{err}, probably due to having no protected data in protect_original (mask all false). Check known cohort marginals: {known_cohort_marginals.isna()}"
-            raise KeyError(msg)   # TODO convert to logger warning
-
-        try:
-            type_marginals = (
-                working_df.loc[:, known_type_marginals.isna()]
-                # working_df.loc[cohort_total_label, :]
-                # .sub(known_type_marginals, fill_value=0)  # subtract known values, put zeroes where there are Nans to retain original values
-                .drop(type_total_label, axis=1)
-                .replace(0, 0.1)  # replace zero values
-            ).loc[cohort_total_label,:]
-        except KeyError as err:
-            msg = f"{err}, probably due to having no protected data in protect_original (mask all false). Check known type marginals: {known_type_marginals.isna()}"
-            raise KeyError(msg) # TODO convert to logger warning
-
-    else:
-        # legacy code? remove?
-        # FIX: first, remove the 'True' data in marginals - here, we're only interested by marginals; defaults to empty mask
-        empty_mask = pd.DataFrame(False, index=working_df.index, columns=working_df.columns)
-        known_type_marginals = working_df[empty_mask].loc[cohort_total_label, :]
-        known_cohort_marginals = working_df[empty_mask].loc[:, type_total_label]
-
-        # keep rows where everything is zero separate
-        zeros = working_df.where(working_df == 0).dropna()
-        nonzeros = working_df.where(working_df != 0).dropna(how="all")
-
-        working_df = working_df.replace(0, 0.1)
-
-        # Extract current marginals
-        try:
-            cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
-                type_total_label
-            ].fillna(0)  # cohort_total_label == 1608-2025; the Fillna is specifically for the case where all data is protected, so it's bumped here. may not be necessary, I might need to delete or treat this case separately in a elif # FIXME 
-            type_marginals = nonzeros.drop(type_total_label, axis=1).loc[
-                cohort_total_label, :
-            ].fillna(0)  # type_total_label == 'total'; the Fillna is specifically for the case where all data is protected, so it's bumped here. may not be necessary, I might need to delete or treat this case separately in a elif # FIXME 
-        except KeyError as err:
-            logger.error(f"Missing expected label in DataFrame: {err}")
-            raise
-
-    print(f"Type marginals: \n{type_marginals}")
-    print(f"Cohort_marginals: \n{cohort_marginals}")
-    # NOTE: here, the balance of the rows and cols MUST be *at least* the value of the protected data (assuming the mask is correct - perhaps raise a warning here, just to make sure that any such modifications are wanted)
-    print(f"known types: \n{working_df.loc[known_cohort_marginals.notna(),type_marginals.index].sum()}, exp. total: {type_total}")    
-    print(f"known cohorts: \n{working_df.loc[cohort_marginals.index, known_type_marginals.notna()].sum(axis=1)}, exp. total: {cohort_total}")
-    # FIXME need to extract only the correct data, now the filter doesn't work properly. should extract 3 type marginals but also extract the 
-
-    # Adjust marginals using Largest Remainder Method
-    # adj_type_marginals = round_consistent_sum(type_marginals.loc[cohort_total_label,:].to_numpy(), type_total)
-    adj_type_marginals = round_consistent_sum(type_marginals.to_numpy(), type_total)
-    # adj_cohort_marginals = round_consistent_sum(cohort_marginals.loc[:, type_total_label].to_numpy(), cohort_total)
-    adj_cohort_marginals= round_consistent_sum(cohort_marginals.to_numpy(), cohort_total)
-
-    print(f"Adjusted type marginals: {adj_type_marginals}")
-    print(f"Adjusted cohort marginals: {adj_cohort_marginals}")
-
-    # FIXME REPRENDRE. here we use maximum; if the column maximum is higher than the sum of known values, nothing changes. For instance, in my example, if mobile type marginal is 120, it's not 'updated' by having known values of 80. However, if it's smaller (e.g., for 1608-1920, 0 when sum is 20, then the value is updated. ) FIXME this must be done later; otherwise the value is modified by round consistent sum. I moved it to after adj_type_marginals. NOTE It's not np.maximum - otherwise, it correctly overwrites the '20' values and keeps it stable, but it does not overwrite and keep the initial 'protected' 70 in single'attached.
-    updated_type_marginals = np.maximum(
-        adj_type_marginals,
-        working_df.loc[known_cohort_marginals.notna(),type_marginals.index].sum().to_numpy(),
+    # Initialize data protector
+    protector = DataProtector(
+        working_df, protect_original, cohort_total_label, type_total_label
     )
 
-    updated_cohort_marginals = np.maximum(
-        adj_cohort_marginals,
-        working_df.loc[cohort_marginals.index, known_type_marginals.notna()].sum(axis=1).to_numpy(),
+    # Validate desired sum against protected data
+    is_valid, error_msg = protector.validate_desired_sum(desired_sum, atol, rtol)
+    if not is_valid:
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    # Calculate adjusted targets
+    type_total, cohort_total = protector.calculate_adjusted_targets(desired_sum)
+
+    # Get protected sums for reporting
+    protected_type_sum, protected_cohort_sum = protector.get_protected_sums()
+
+    # Get modifiable indices
+    mod_rows, mod_cols = protector.get_modifiable_indices()
+
+    # Extract marginals
+    type_marginals, cohort_marginals = MarginalExtractor.extract_marginals(
+        working_df, cohort_total_label, type_total_label, replace_zeros=True
     )
 
-    print(f"updated type marginals: {updated_type_marginals}")
-    print(f"updated cohort marginals: {updated_cohort_marginals}")
+    # Filter to modifiable parts only
+    type_marginals_mod = type_marginals.loc[mod_cols]
+    cohort_marginals_mod = cohort_marginals.loc[mod_rows]
 
-    # Log the modifications  # TODO also return them, e.g, through a dataclass?
-    type_diff = updated_type_marginals - type_marginals.to_numpy()
-    cohort_diff = updated_cohort_marginals - cohort_marginals.to_numpy()
+    # Get protected values to calculate floor values
+    protected_types, protected_cohorts = protector.get_protected_marginals()
 
-    # Identify target indexes and columns
-    if not known_type_marginals.empty or not known_cohort_marginals.empty:
-        rows = cohort_marginals.index[cohort_marginals.index != cohort_total_label]
-        cols = [col for col in type_marginals.index if col != type_total_label]
+    # Calculate minimum values (floors) from protected interior cells
+    # For type marginals: sum of protected cohort rows for each modifiable column
+    # NOTE these two lines were modified by the code below, to account for the new behaviour. Marginals should *not* be protected; only interior data is. OR, at least, we can't do both: interior data OR marginals must be protected. Since we are modifying the marginals, it makes more sense to make them unprotected.
+    # type_floors = working_df.loc[protected_cohorts.notna(), mod_cols].sum()
+    # cohort_floors = working_df.loc[mod_rows, protected_types.notna()].sum(axis=1)
+
+    # Get the interior cells (excluding marginal row and column)
+    interior_rows = working_df.index.drop(cohort_total_label)
+    interior_cols = working_df.columns.drop(type_total_label)
+
+    # Get protection mask for interior cells
+    if protect_original is not None:
+        # Ensure mask aligns with working_df
+        aligned_mask = protect_original.reindex(
+            index=working_df.index, 
+            columns=working_df.columns, 
+            fill_value=False
+        ).fillna(False)
+        interior_protection = aligned_mask.loc[interior_rows, interior_cols]
     else:
-        rows = nonzeros.index[nonzeros.index != cohort_total_label]
-        cols = [col for col in nonzeros.columns if col != type_total_label]
+        interior_protection = pd.DataFrame(
+            False, index=interior_rows, columns=interior_cols
+        )
 
-    # FIXME REDO logging and/or this check
-    # if type_diff.sum() + cohort_diff.sum() == 0:
-    #     logger.info("Marginals fit; no modifications required.")
-    # else:
-    #     if sum(type_diff) != 0:
-    #         logger.info(
-    #             f"Modified type marginals: {sum(type_diff)} units ({type_diff}) from {nonzeros.loc[cohort_total_label, cols].to_json()}"
-    #         )
+    # Type floors: for each modifiable column, sum protected interior cells
+    type_floors = pd.Series(0.0, index=mod_cols)
+    for col in mod_cols:
+        if col in interior_protection.columns:
+            mask = interior_protection[col]
+            type_floors[col] = working_df.loc[mask[mask].index, col].sum()
 
-    #     if sum(cohort_diff) != 0:
-    #         logger.info(
-    #             f"Modified cohort marginals: {sum(cohort_diff)} units ({cohort_diff}) from {nonzeros.loc[rows, type_total_label].to_json()}"
-    #         )
+    # Cohort floors: for each modifiable row, sum protected interior cells
+    cohort_floors = pd.Series(0.0, index=mod_rows)
+    for row in mod_rows:
+        if row in interior_protection.index:
+            mask = interior_protection.loc[row, :]
+            cohort_floors[row] = working_df.loc[row, mask[mask].index].sum()
 
-    # Assign results to DataFrame
-    # For the type totals: assign to all rows except the cohort total row.
-    working_df.loc[rows, type_total_label] = pd.Series(updated_cohort_marginals, index=rows)
+    # Also need to handle PROTECTED rows - their marginals must equal their interior sum
+    # For protected cohort rows (not modifiable), update their marginal to match interior
+    protected_rows = interior_rows.difference(mod_rows)
+    for row in protected_rows:
+        if row in interior_protection.index:
+            # Sum ALL interior cells for this protected row (they're all protected)
+            interior_sum = working_df.loc[row, interior_cols].sum()
+            # Update the marginal to match
+            working_df.loc[row, type_total_label] = interior_sum
 
-    # For the cohort total: assign to all columns except the type_total column.
-    working_df.loc[cohort_total_label, cols] = pd.Series(updated_type_marginals, index=cols)
+    # Recalculate protected_cohort_sum after fixing protected row marginals
+    protected_types, protected_cohorts = protector.get_protected_marginals()
+    # Update protected_cohort_sum based on corrected marginals
+    protected_cohort_sum = working_df.loc[protected_cohorts.notna().index[protected_cohorts.notna()], type_total_label].sum()
 
-    # For the desired_sum value
+    # Recalculate cohort_total after adjusting protected rows
+    cohort_total = desired_sum - protected_cohort_sum
+
+    # Check if floors exceed available budget
+    type_floor_sum = type_floors.sum()
+    cohort_floor_sum = cohort_floors.sum()
+
+    if type_floor_sum > type_total + atol:  # FIXME use atol and rtol correctly
+        msg = (
+            f"Sum of type floors ({type_floor_sum:.2f}) exceeds available type budget "
+            f"({type_total:.2f}). Cannot balance marginals."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if cohort_floor_sum > cohort_total + atol:
+        msg = (
+            f"Sum of cohort floors ({cohort_floor_sum:.2f}) exceeds available cohort budget "
+            f"({cohort_total:.2f}). Cannot balance marginals."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+    # For TYPE marginals:
+    # Calculate the "free" portion (total minus floors)
+    type_free_budget = int(type_total - type_floor_sum)
+    
+    # Get the current marginal values minus their floors (what's freely adjustable)
+    type_marginals_above_floor = np.maximum(
+        type_marginals_mod.to_numpy() - type_floors.to_numpy(), 0
+    )
+    
+    # Only apply round_consistent_sum to the free portion if there's budget
+    if type_free_budget > 0 and type_marginals_above_floor.sum() > 0:
+        adj_type_free = round_consistent_sum(type_marginals_above_floor, type_free_budget)
+        adj_type_marginals = np.array(adj_type_free) + type_floors.to_numpy().astype(int)
+    else:
+        # No free budget, just use floors (rounded)
+        adj_type_marginals = np.ceil(type_floors.to_numpy()).astype(int)
+
+    # For COHORT marginals:
+    cohort_free_budget = int(cohort_total - cohort_floor_sum)
+    
+    cohort_marginals_above_floor = np.maximum(
+        cohort_marginals_mod.to_numpy() - cohort_floors.to_numpy(), 0
+    )
+    
+    if cohort_free_budget > 0 and cohort_marginals_above_floor.sum() > 0:
+        adj_cohort_free = round_consistent_sum(cohort_marginals_above_floor, cohort_free_budget)
+        adj_cohort_marginals = np.array(adj_cohort_free) + cohort_floors.to_numpy().astype(int)
+    else:
+        adj_cohort_marginals = np.ceil(cohort_floors.to_numpy()).astype(int)
+
+    # Ensure floors are respected (safety check)
+    adj_type_marginals = np.maximum(adj_type_marginals, np.ceil(type_floors.to_numpy()).astype(int))
+    adj_cohort_marginals = np.maximum(adj_cohort_marginals, np.ceil(cohort_floors.to_numpy()).astype(int))
+
+    # Calculate differences
+    type_diff = adj_type_marginals - type_marginals_mod.to_numpy()
+    cohort_diff = adj_cohort_marginals - cohort_marginals_mod.to_numpy()
+
+    # Log adjustments
+    if np.any(type_diff != 0):
+        logger.info(
+            f"Type marginal adjustments: {type_diff} (total: {type_diff.sum()})"
+        )
+    if np.any(cohort_diff != 0):
+        logger.info(
+            f"Cohort marginal adjustments: {cohort_diff} (total: {cohort_diff.sum()})"
+        )
+
+    # Update DataFrame
+    working_df.loc[mod_rows, type_total_label] = pd.Series(
+        adj_cohort_marginals, index=mod_rows
+    )
+    working_df.loc[cohort_total_label, mod_cols] = pd.Series(
+        adj_type_marginals, index=mod_cols
+    )
     working_df.loc[cohort_total_label, type_total_label] = desired_sum
 
-    if isinstance(zeros, pd.DataFrame) and not zeros.empty:
-        # Concat nonzeros and zero data
-        result = pd.concat([nonzeros, zeros])  # NOTE: delted astype int; add it, and add nan support or convert them first? .astype("int")
-    else: 
-        result = working_df
+    # Convert to integers only at the end
+    numeric_cols = working_df.select_dtypes(include=[np.number]).columns
+    working_df[numeric_cols] = working_df[numeric_cols].round().astype(int)
 
-    # col_order = ["total"] + sorted(dw_types)
-    return result
+    return MarginalAdjustment(
+        adjusted_df=working_df,
+        type_diff=type_diff.astype(int),
+        cohort_diff=cohort_diff.astype(int),
+        type_marginals=type_marginals,
+        cohort_marginals=cohort_marginals,
+        protected_type_sum=int(round(protected_type_sum)),
+        protected_cohort_sum=int(round(protected_cohort_sum)),
+    )
 
 
 def apply_ipfn(
@@ -630,116 +843,171 @@ def pivot_with_mask(
 
 def reconcile_data_with_marginals(
     df: pd.DataFrame,
-    label: str = "vintage",
-    desired_sum: int = None,
+    label: str = VINTAGE_COL,
+    desired_sum: Optional[int] = None,
     dw_types: list[str] = TARGET_TYPES,
-    type_total_label: str = "total",
-    cohort_total_label: str = "1608-2025",
-    convergence_rate=1e-6,
+    type_total_label: str = TYPE_TOTAL_LABEL,
+    cohort_total_label: str = COHORT_TOTAL_LABEL,
+    convergence_rate: float = 1e-6,
     max_iter: int = 500,
-    protect_original: Optional[
-        pd.DataFrame
-    ] = None,  # pass a mask if you want to protect the original data
-) -> pd.DataFrame:
-    # NOTE should we protect initial data?
+    zero_replacement: float = ZERO_REPLACEMENT,
+    protect_original: Optional[pd.DataFrame] = None,
+    atol: float = DEFAULT_ATOL,
+    rtol: float = DEFAULT_RTOL,
+) -> IPFNResult:
+    """
+    Reconcile data with marginals using fix_marginals and IPFN.
 
-    # accept dataframe
-    working_df = df.copy()
-
-    # add option to protect initial data
-    if protect_original is not None:
-        working_df = fix_marginals(
-            working_df,
-            desired_sum=desired_sum,
-            label=label,
-            dw_types=dw_types,
-            type_total_label=type_total_label,
-            cohort_total_label=cohort_total_label,
-            protect_original=protect_original,
-        )
-        working_df = working_df.replace(
-            0, 0.1
-        )  # FIXME; here, replacing all zeros doesn't work, I need to replace only 'Nan' zeros, and zeros in totals. Maybe not needed after changes in fix_marginals
-    else:
-        # first, fix_marginals
-        working_df = fix_marginals(
-            working_df,
-            desired_sum=desired_sum,
-            label=label,
-            dw_types=dw_types,
-            type_total_label=type_total_label,
-            cohort_total_label=cohort_total_label,
-        )  # FIXME: this can return dataframes with zeroes, which can lead to issues in the IPFN. For now, kept for legacy tests; this might need to be corrected, like in the case where protect_original is passed a mask.
-
-    # then, apply_ipfn
-    try:
-        nonzeros = working_df.where(working_df > 0).dropna()
-        zeros = working_df.where(working_df == 0).dropna()
-        if nonzeros.empty:
-            msg = (
-                "No nonzero values found in working dataframe. "
-                "Ensure that the dataframe contains valid data before applying IPFN."
-            )
-            logger.error(msg)
-            raise ValueError(msg)
-    except ValueError as err:
-        msg = (
-            f"Error while processing working_df: {err}. "
-            "This might be caused by an empty or incorrectly formatted dataframe "
-            "returned from fix_marginals."
-        )
-        logger.error(msg)
-        raise RuntimeError(msg)
-
-    # FIXME NOT DRY
-    
-    cohort_marginals = nonzeros.drop(cohort_total_label, axis=0)[
-        type_total_label
-    ].to_numpy()
-    type_marginals = (
-        nonzeros.drop(type_total_label, axis=1).loc[cohort_total_label, :].to_numpy()
+    Raises:
+        ValueError: If desired_sum incompatible with protected data
+        RuntimeError: If IPFN processing fails
+    """
+    # Step 1: Fix marginals (includes validation)
+    marginal_result = fix_marginals(
+        df=df,
+        desired_sum=desired_sum,
+        label=label,
+        dw_types=dw_types,
+        type_total_label=type_total_label,
+        cohort_total_label=cohort_total_label,
+        protect_original=protect_original,
+        atol=atol,
+        rtol=rtol,
     )
 
-    arr_ini = nonzeros.drop(
-        index=[cohort_total_label], columns=[type_total_label]
-    ).to_numpy()
+    working_df = marginal_result.adjusted_df
 
-    # Protect original data
-    print(f"arr ini: \n{arr_ini}")
-    print(f"cohort: {cohort_marginals}")
-    print(f"type: {type_marginals}")
+    # # Replace remaining zeros for IPFN
+    # if protect_original is not None:
+    #     working_df = working_df.replace(0, ZERO_REPLACEMENT)
 
+    # Replace zeros for IPFN to avoid division by zero
+    # Store which values were originally zero so we can restore them later if needed
+    zero_mask = working_df == 0 # FIXME unused for now?
+    working_df = working_df.replace(0, zero_replacement)
 
-    # FIXME adjust behaviour to keep original data (trusted_values)
+    # Step 2: Run IPFN
+    # Extract the data matrix (excluding marginals)
+    data_matrix = working_df.drop(cohort_total_label).drop(type_total_label, axis=1)
 
-    arr_new = apply_ipfn(
-        arr=arr_ini.copy(),
-        aggregates=[cohort_marginals, type_marginals],
-        dimensions=[[0], [1]],  # dimension over which the 'sum' is made
-        convergence_rate=convergence_rate,
-        max_iter=max_iter,
-    )  # FIXME: if there is only one value for ipfn (40, 0.1, 0.1, 0.1), everything should be alloted to the real value? now, 110 become (107, 2, 0, 0)...
+    # Extract target marginals
+    cohort_marginals = working_df.drop(cohort_total_label).loc[:, type_total_label]
+    type_marginals = working_df.drop(type_total_label, axis=1).loc[
+        cohort_total_label, : 
+    ]
 
-    diff = (arr_new - arr_ini).round(decimals=2)
-    logger.debug(f"Initial array before IPFN: {arr_ini.ravel()}")
-    logger.debug(f"IPFN adjustment difference (rounded): {diff.ravel()}")
-    logger.info(
-        f"Sum of IPFN adjustment difference: {diff.sum().round(decimals=2)}"
-    )  # NOTE: this should match the marginal adjustment
+    # Store initial values for difference calculation
+    initial_matrix = data_matrix.copy()
 
-    target_rows = nonzeros.index[nonzeros.index != cohort_total_label]
-    target_cols = [col for col in nonzeros.columns if col != type_total_label]
-    nonzeros.loc[target_rows, target_cols] = (
-        arr_new.round()
-    )  # FIXME, instead of modyfying rows and cols, overwrite with a dataframe of target_rows, target_cols?
+    # Run IPFN
+    try:
+        ipfn_result = apply_ipfn(
+            data_matrix.to_numpy(),
+            aggregates=[cohort_marginals.to_numpy(), type_marginals.to_numpy()],
+            dimensions=[[0], [1]],
+            convergence_rate=convergence_rate,
+            max_iter=max_iter,
+        )
+        converged = True
+        iterations = max_iter  # We don't track actual iterations in apply_ipfn
+    except Exception as e:
+        logger.error(f"IPFN failed: {e}")
+        raise RuntimeError(f"IPFN processing failed: {e}")
 
-    result = pd.concat([nonzeros.astype("int"), zeros.astype("int")])
-    # display(result)
+    # Reconstruct the full DataFrame
+    result = working_df.copy()
+    result.loc[data_matrix.index, data_matrix.columns] = ipfn_result.astype(int)
 
-    return (
-        result,
-        diff,
-    )  # FIXME improve logging and tests by instead returning a container (dataclass) with relevant information, e.g., result, diff, type and cohort marginals adjustements, etc.?
+    # # Calculate difference # TODO delete, DEPRECATED 
+    # diff = result.copy().astype(float)
+    # diff.loc[data_matrix.index, data_matrix.columns] = (
+    #     ipfn_result - initial_matrix.to_numpy()
+    # )
+
+    # # If we have protection, restore protected values and zero out their diffs
+    # if protect_original is not None:
+    #     # Restore original protected values
+    #     try: 
+    #         result[protect_original] = df.set_index(label)[protect_original]
+    #         diff[protect_original] = 0
+    #     except KeyError as err:
+    #         logger.warning(f"Error: {err}. Attempting without set_index")  # This is because "vintage" might already be in df.index
+    #         result[protect_original] = df[protect_original]
+    #         diff[protect_original] = 0
+
+    # return IPFNResult(
+    #     result=result,
+    #     difference=diff,
+    #     convergence_achieved=converged,
+    #     iterations=iterations,
+    # )
+
+    # Calculate difference BEFORE restoring protected values
+    diff = result.copy()
+    diff.loc[data_matrix.index, data_matrix.columns] = (
+        result.loc[data_matrix.index, data_matrix.columns].to_numpy() 
+        - initial_matrix.to_numpy()
+    )
+
+    # If we have protection, restore protected values and zero out their diffs
+    if protect_original is not None:
+        # Align the mask with result DataFrame (same index/columns)
+        aligned_mask = protect_original.reindex(
+            index=result.index,
+            columns=result.columns,
+            fill_value=False
+        ).fillna(False)
+        
+        # Get original values aligned with result
+        try:
+            original_aligned = df.set_index(label).reindex(
+                index=result.index,
+                columns=result.columns
+            )
+        except KeyError as err:
+            logger.warning(f"Error: {err}. Attempting without set_index")  # This is because "vintage" might already be in df.index
+            original_aligned = df.reindex(
+                index=result.index,
+                columns=result.columns
+            )
+        
+        # Restore protected values
+        result = result.where(~aligned_mask, original_aligned)
+        
+        # Zero out differences for protected values
+        diff = diff.where(~aligned_mask, 0)
+
+    # Restore zeros that should remain zero (where original was zero and not protected)
+    if protect_original is not None:
+        aligned_mask = protect_original.reindex(
+            index=result.index,
+            columns=result.columns,
+            fill_value=False
+        ).fillna(False)
+        # Where originally zero AND not protected, set back to zero
+        should_be_zero = zero_mask & ~aligned_mask
+        result = result.where(~should_be_zero, 0)
+    else:
+        # No protection, restore all original zeros
+        result = result.where(~zero_mask, 0)
+
+    # Convert final results to integers
+    numeric_cols = result.select_dtypes(include=[np.number]).columns
+    result[numeric_cols] = result[numeric_cols].round().astype(int)
+    
+    numeric_cols_diff = diff.select_dtypes(include=[np.number]).columns
+    diff[numeric_cols_diff] = diff[numeric_cols_diff].round().astype(int)
+
+    return IPFNResult(
+        result=result,
+        difference=diff,
+        convergence_achieved=converged,
+        iterations=iterations,
+    )
+
+if __name__ == "__main__":
+    infile = "./data/clean/fulldata.parquet"
+    data, mask = interpolate(infile)
 
 
 if __name__ == "__main__":
