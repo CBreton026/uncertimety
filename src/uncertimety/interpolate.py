@@ -647,9 +647,7 @@ def fix_marginals(
     if protect_original is not None:
         # Ensure mask aligns with working_df
         aligned_mask = protect_original.reindex(
-            index=working_df.index, 
-            columns=working_df.columns, 
-            fill_value=False
+            index=working_df.index, columns=working_df.columns, fill_value=False
         ).fillna(False)
         interior_protection = aligned_mask.loc[interior_rows, interior_cols]
     else:
@@ -684,7 +682,9 @@ def fix_marginals(
     # Recalculate protected_cohort_sum after fixing protected row marginals
     protected_types, protected_cohorts = protector.get_protected_marginals()
     # Update protected_cohort_sum based on corrected marginals
-    protected_cohort_sum = working_df.loc[protected_cohorts.notna().index[protected_cohorts.notna()], type_total_label].sum()
+    protected_cohort_sum = working_df.loc[
+        protected_cohorts.notna().index[protected_cohorts.notna()], type_total_label
+    ].sum()
 
     # Recalculate cohort_total after adjusting protected rows
     cohort_total = desired_sum - protected_cohort_sum
@@ -711,36 +711,48 @@ def fix_marginals(
     # For TYPE marginals:
     # Calculate the "free" portion (total minus floors)
     type_free_budget = int(type_total - type_floor_sum)
-    
+
     # Get the current marginal values minus their floors (what's freely adjustable)
     type_marginals_above_floor = np.maximum(
         type_marginals_mod.to_numpy() - type_floors.to_numpy(), 0
     )
-    
+
     # Only apply round_consistent_sum to the free portion if there's budget
     if type_free_budget > 0 and type_marginals_above_floor.sum() > 0:
-        adj_type_free = round_consistent_sum(type_marginals_above_floor, type_free_budget)
-        adj_type_marginals = np.array(adj_type_free) + type_floors.to_numpy().astype(int)
+        adj_type_free = round_consistent_sum(
+            type_marginals_above_floor, type_free_budget
+        )
+        adj_type_marginals = np.array(adj_type_free) + type_floors.to_numpy().astype(
+            int
+        )
     else:
         # No free budget, just use floors (rounded)
         adj_type_marginals = np.ceil(type_floors.to_numpy()).astype(int)
 
     # For COHORT marginals:
     cohort_free_budget = int(cohort_total - cohort_floor_sum)
-    
+
     cohort_marginals_above_floor = np.maximum(
         cohort_marginals_mod.to_numpy() - cohort_floors.to_numpy(), 0
     )
-    
+
     if cohort_free_budget > 0 and cohort_marginals_above_floor.sum() > 0:
-        adj_cohort_free = round_consistent_sum(cohort_marginals_above_floor, cohort_free_budget)
-        adj_cohort_marginals = np.array(adj_cohort_free) + cohort_floors.to_numpy().astype(int)
+        adj_cohort_free = round_consistent_sum(
+            cohort_marginals_above_floor, cohort_free_budget
+        )
+        adj_cohort_marginals = np.array(
+            adj_cohort_free
+        ) + cohort_floors.to_numpy().astype(int)
     else:
         adj_cohort_marginals = np.ceil(cohort_floors.to_numpy()).astype(int)
 
     # Ensure floors are respected (safety check)
-    adj_type_marginals = np.maximum(adj_type_marginals, np.ceil(type_floors.to_numpy()).astype(int))
-    adj_cohort_marginals = np.maximum(adj_cohort_marginals, np.ceil(cohort_floors.to_numpy()).astype(int))
+    adj_type_marginals = np.maximum(
+        adj_type_marginals, np.ceil(type_floors.to_numpy()).astype(int)
+    )
+    adj_cohort_marginals = np.maximum(
+        adj_cohort_marginals, np.ceil(cohort_floors.to_numpy()).astype(int)
+    )
 
     # Calculate differences
     type_diff = adj_type_marginals - type_marginals_mod.to_numpy()
@@ -883,7 +895,7 @@ def reconcile_data_with_marginals(
 
     # Replace zeros for IPFN to avoid division by zero
     # Store which values were originally zero so we can restore them later if needed
-    zero_mask = working_df == 0 # FIXME unused for now?
+    zero_mask = working_df == 0  # FIXME unused for now?
     working_df = working_df.replace(0, zero_replacement)
 
     # Step 2: Run IPFN
@@ -893,7 +905,7 @@ def reconcile_data_with_marginals(
     # Extract target marginals
     cohort_marginals = working_df.drop(cohort_total_label).loc[:, type_total_label]
     type_marginals = working_df.drop(type_total_label, axis=1).loc[
-        cohort_total_label, : 
+        cohort_total_label, :
     ]
 
     # Store initial values for difference calculation
@@ -918,7 +930,7 @@ def reconcile_data_with_marginals(
     result = working_df.copy()
     result.loc[data_matrix.index, data_matrix.columns] = ipfn_result.astype(int)
 
-    # # Calculate difference # TODO delete, DEPRECATED 
+    # # Calculate difference # TODO delete, DEPRECATED
     # diff = result.copy().astype(float)
     # diff.loc[data_matrix.index, data_matrix.columns] = (
     #     ipfn_result - initial_matrix.to_numpy()
@@ -927,7 +939,7 @@ def reconcile_data_with_marginals(
     # # If we have protection, restore protected values and zero out their diffs
     # if protect_original is not None:
     #     # Restore original protected values
-    #     try: 
+    #     try:
     #         result[protect_original] = df.set_index(label)[protect_original]
     #         diff[protect_original] = 0
     #     except KeyError as err:
@@ -945,7 +957,7 @@ def reconcile_data_with_marginals(
     # Calculate difference BEFORE restoring protected values
     diff = result.copy()
     diff.loc[data_matrix.index, data_matrix.columns] = (
-        result.loc[data_matrix.index, data_matrix.columns].to_numpy() 
+        result.loc[data_matrix.index, data_matrix.columns].to_numpy()
         - initial_matrix.to_numpy()
     )
 
@@ -953,36 +965,30 @@ def reconcile_data_with_marginals(
     if protect_original is not None:
         # Align the mask with result DataFrame (same index/columns)
         aligned_mask = protect_original.reindex(
-            index=result.index,
-            columns=result.columns,
-            fill_value=False
+            index=result.index, columns=result.columns, fill_value=False
         ).fillna(False)
-        
+
         # Get original values aligned with result
         try:
             original_aligned = df.set_index(label).reindex(
-                index=result.index,
-                columns=result.columns
+                index=result.index, columns=result.columns
             )
         except KeyError as err:
-            logger.warning(f"Error: {err}. Attempting without set_index")  # This is because "vintage" might already be in df.index
-            original_aligned = df.reindex(
-                index=result.index,
-                columns=result.columns
-            )
-        
+            logger.warning(
+                f"Error: {err}. Attempting without set_index"
+            )  # This is because "vintage" might already be in df.index
+            original_aligned = df.reindex(index=result.index, columns=result.columns)
+
         # Restore protected values
         result = result.where(~aligned_mask, original_aligned)
-        
+
         # Zero out differences for protected values
         diff = diff.where(~aligned_mask, 0)
 
     # Restore zeros that should remain zero (where original was zero and not protected)
     if protect_original is not None:
         aligned_mask = protect_original.reindex(
-            index=result.index,
-            columns=result.columns,
-            fill_value=False
+            index=result.index, columns=result.columns, fill_value=False
         ).fillna(False)
         # Where originally zero AND not protected, set back to zero
         should_be_zero = zero_mask & ~aligned_mask
@@ -994,7 +1000,7 @@ def reconcile_data_with_marginals(
     # Convert final results to integers
     numeric_cols = result.select_dtypes(include=[np.number]).columns
     result[numeric_cols] = result[numeric_cols].round().astype(int)
-    
+
     numeric_cols_diff = diff.select_dtypes(include=[np.number]).columns
     diff[numeric_cols_diff] = diff[numeric_cols_diff].round().astype(int)
 
@@ -1004,6 +1010,7 @@ def reconcile_data_with_marginals(
         convergence_achieved=converged,
         iterations=iterations,
     )
+
 
 if __name__ == "__main__":
     infile = "./data/clean/fulldata.parquet"
