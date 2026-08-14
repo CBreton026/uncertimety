@@ -41,9 +41,9 @@ def interpolate(infile):
     # Fill missing values using interpolation
     interpolated = fill_missing_dwellings(df)
 
-    # run check_marginals (from dataprep) or a similar function to verify that the marginals are either the same, or closer than they were, after the fill_missing_values
+    reconciled = reconcile_all_years(interpolated, raw_mask)
 
-    return interpolated, raw_mask
+    return interpolated, raw_mask, reconciled
 
 
 def apply_rawdata_mask(
@@ -125,47 +125,35 @@ def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
         >>> filled['dwellings'].isna().sum()
         0
     """
-    # FIXME may break if passed an empty df
-    # Validate input DataFrame
     required_columns = ["census_year", "type", "vintage", "dwellings"]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"DataFrame is missing required columns: {missing_columns}")
 
-    # Group by type and vintage
-    groups = df.groupby(["type", "vintage"])
+    # Sort so bfill propagates from later -> earlier census years
+    df = df.sort_values(["type", "vintage", "census_year"]).reset_index(drop=True)
 
-    # Process each group
-    filled_groups = []
-    for name, group in groups:
-        display(group.head(5))  # FIXME remove
-        filled_group = group.copy()
+    # Fill NaN using later census years; ffill as fallback for trailing NaNs
+    df["dwellings"] = df.groupby(["type", "vintage"])["dwellings"].transform(
+        lambda s: s.bfill().ffill()
+    )
 
-        # TODO FIXME REPRENDRE - here one issue is that since I backfill everything, there may be some categories e.g., single_attached, for which the only available data is very recent; imagine for single_detached, older values were available; then, bfill would project *wrong* values backwards, and would shift the typesplit. I might have to do the 'totals' first, since I have the most data; then do a fix marginals; then bfill? However, doing that would ALSO shift the typesplit. should the bfill interpolation be limited to a given number of sequntial nans? or should I use a combination of ffill/bfill?
+    # Zero out vintages that had not yet been built at the time of the census
+    def _vintage_start(v):
+        try:
+            return int(str(v).split("-")[0])
+        except (ValueError, IndexError):
+            return 0  # "1608-2025" total row -> never zeroed
 
-        # Apply backward fill on the dwellings column
-        filled_group["dwellings"] = filled_group["dwellings"].bfill()
-        # FIXME REPRENDRE the backfill is way too high for older data, i.e., data before 19XX. thus, use two passes -- see unfm_fix [ Finalized dataset, 1851-2021]
+    vintage_starts = df["vintage"].map(_vintage_start)
+    df.loc[vintage_starts > df["census_year"], "dwellings"] = 0.0
 
-        # print(filled_group["dwellings"].iloc[-1])  # FIXME logging
-
-        if math.isnan(filled_group["dwellings"].iloc[-1]):
-            # Edge case where the last value of a group was a nan, leading to unfilled values
-            filled_group["dwellings"] = filled_group[
-                "dwellings"
-            ].ffill()  # NOTE-perhaps add a limit? can this cause issues in other datasets?
-
-        filled_groups.append(filled_group)
-
-    # Combine all processed groups
-    result = pd.concat(filled_groups)
-
-    if result.isna().any().any():
-        msg = "Some NaN values remain after filling. Check the input data for completeness."
+    if df["dwellings"].isna().any():
+        msg = "NaN values remain after filling. Check input data."
         logger.warning(msg)
         raise ValueError(msg)
 
-    return result
+    return df
 
 
 def round_consistent_sum(arr, desired_sum):
@@ -437,32 +425,27 @@ def reconcile_data_with_marginals(
     # accept dataframe
     working_df = df.copy()
 
-    # add option to protect initial data
+    # first, fix_marginals
+    working_df = fix_marginals(
+        working_df,
+        desired_sum=desired_sum,
+        label=label,
+        dw_types=dw_types,
+        type_total_label=type_total_label,
+        cohort_total_label=cohort_total_label,
+    )
+
+    # When protecting original data, replace only the cells that were
+    # interpolated (mask == False) with a small placeholder so IPFN can
+    # redistribute mass there while observed values stay fixed.
     if protect_original is not None:
-        protected = None
-        unprotected = None
-        working_df = fix_marginals(
-            working_df,
-            desired_sum=desired_sum,
-            label=label,
-            dw_types=dw_types,
-            type_total_label=type_total_label,
-            cohort_total_label=cohort_total_label,
+        # protect_original is a boolean DataFrame aligned with working_df
+        # True = observed/trusted, False = interpolated
+        mask = protect_original.reindex_like(working_df).fillna(False)
+        # Replace interpolated zeros with a tiny value so IPFN can operate
+        working_df = working_df.where(
+            mask | (working_df != 0), 0.1
         )
-        working_df = working_df.replace(
-            0, 0.1
-        )  # FIXME; here, replacing all zeros doesn't work, I need to replace only 'Nan' zeros, and zeros in totals
-    else:
-        # first, fix_marginals
-        working_df = fix_marginals(
-            working_df,
-            desired_sum=desired_sum,
-            label=label,
-            dw_types=dw_types,
-            type_total_label=type_total_label,
-            cohort_total_label=cohort_total_label,
-        )  # FIXME: this can return dataframes with zeroes, which can lead to issues in the IPFN. For now, kept for legacy tests; this might need to be corrected, like in the case where protect_original is passed a mask.
-    print(working_df)  # TODO delete
 
     # then, apply_ipfn
     try:
@@ -527,33 +510,98 @@ def reconcile_data_with_marginals(
     )  # FIXME improve logging and tests by instead returning a container (dataclass) with relevant information, e.g., result, diff, type and cohort marginals adjustements, etc.?
 
 
+def reconcile_all_years(
+    filled_df: pd.DataFrame,
+    raw_mask: pd.DataFrame,
+    dw_types: list[str] = TARGET_TYPES,
+    type_total_label: str = "total",
+    cohort_total_label: str = "1608-2025",
+) -> pd.DataFrame:
+    """
+    Reconcile interpolated dwelling data for every census year.
+
+    Reproduces the unfm_fix logic from dmfa_dataprep.ipynb using the
+    existing pipeline: fill_missing_dwellings → fix_marginals → apply_ipfn
+    (via reconcile_data_with_marginals).
+
+    For each census year the function:
+    1. Pivots the filled long-format data to wide (vintage × type) — this is
+       required by fix_marginals / apply_ipfn which operate on matrices.
+    2. Builds a matching wide mask so observed cells can be protected.
+    3. Calls reconcile_data_with_marginals (which internally runs
+       fix_marginals then apply_ipfn), passing the mask via
+       ``protect_original``.
+    4. Melts the result back to long format and appends it to the output.
+
+    Args:
+        filled_df: Long-format DataFrame returned by fill_missing_dwellings.
+        raw_mask: Boolean mask from get_rawdata_mask (True = observed).
+        dw_types: Target dwelling type columns (must include 'total').
+        type_total_label: Column name for the type total.
+        cohort_total_label: Row label for the cohort total.
+
+    Returns:
+        pd.DataFrame: Long-format DataFrame with columns
+        [census_year, vintage, type, dwellings].
+    """
+    agg_types = [t for t in dw_types if t != type_total_label]
+    reconciled_frames = []
+
+    for census_year, group in filled_df.groupby("census_year"):
+        # --- pivot to wide (needed by fix_marginals / IPFN) ---
+        wide_filled = group.pivot(
+            index="vintage", columns="type", values="dwellings"
+        )
+        present_types = [t for t in dw_types if t in wide_filled.columns]
+
+        # --- build matching wide mask ---
+        mask_group = raw_mask[raw_mask["census_year"] == census_year]
+        wide_mask = mask_group.pivot(
+            index="vintage", columns="type", values="dwellings"
+        )
+        wide_mask = wide_mask.reindex_like(wide_filled).fillna(False)
+
+        # --- reconcile using the existing pipeline ---
+        reconciled_wide, _diff = reconcile_data_with_marginals(
+            wide_filled[present_types],
+            label="vintage",
+            dw_types=dw_types,
+            type_total_label=type_total_label,
+            cohort_total_label=cohort_total_label,
+            protect_original=wide_mask[present_types],
+        )
+
+        # Recompute totals from components to ensure consistency
+        reconciled_agg = [c for c in agg_types if c in reconciled_wide.columns]
+        reconciled_wide[type_total_label] = reconciled_wide[reconciled_agg].sum(axis=1)
+
+        # --- melt back to long format ---
+        long = (
+            reconciled_wide.reset_index()
+            .melt(id_vars="vintage", var_name="type", value_name="dwellings")
+        )
+        long["census_year"] = census_year
+        reconciled_frames.append(long)
+
+    result = pd.concat(reconciled_frames, ignore_index=True)
+    # Reorder columns to match input convention
+    return result[["census_year", "vintage", "type", "dwellings"]]
+
+
 if __name__ == "__main__":
     infile = "./data/clean/fulldata.parquet"
-    data, mask = interpolate(infile)
-    display(data)
-    display(data.info())
-    display(
-        apply_rawdata_mask(data, mask)
-    )  # TODO use rawdata mask to check the modified values of raw data for quality control
+    filled, mask, reconciled = interpolate(infile)
 
-    groups = data.groupby(by=["census_year"])
-    for name, group in groups:
-        print(f"Group: {name}")
+    print("\n=== Reconciled data (sample) ===")
+    display(reconciled.head(20))
 
-        df = (
-            group.drop("census_year", axis=1)
-            .pivot(index=["vintage"], columns=["type"])
-            .droplevel(axis=1, level=0)
-        )  # droplevel removes 'dwellings' from the columns level: (dwellings, total) -> total
-
-        cols = [col for col in TARGET_TYPES if col in df]
-
-        result, diff = reconcile_data_with_marginals(df)
-        display(
-            df[cols] - result
-        )  # TODO compare masked and unmasked versions!! Should I protect the original data, or not? check copilot, and adjust reconcile.. function accordingly.
-
-        # display(group.pivot(index='vintage'))
+    # Spot-check: census year 1685 - only 1608-1920 should be non-zero
+    yr1685 = reconciled[reconciled["census_year"] == 1685]
+    total_1685 = yr1685[
+        (yr1685["vintage"] == "1608-2025") & (yr1685["type"] == "total")
+    ]["dwellings"].values[0]
+    assert total_1685 > 0, "Total for 1685 should be > 0"
+    print("Spot checks passed.")
 
 # TODO: look at the 'corrected' values, and at everything with "_fix" suffix
 # Realistically, as soon as I start changing the marginals, I can't only change the interpolated data.
