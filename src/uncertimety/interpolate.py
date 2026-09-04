@@ -1,5 +1,7 @@
 import math
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 import numpy as np
 from operator import itemgetter
 from ipfn import ipfn
@@ -209,7 +211,7 @@ class MarginalExtractor:
         cohort_label: str = COHORT_TOTAL_LABEL,
         type_label: str = TYPE_TOTAL_LABEL,
         replace_zeros: bool = True,
-        zero_replacement: float = ZERO_REPLACEMENT,
+        zero_replacement: float = 0.1, # NOTE : check if fixes issue! it applied the zero replacement to marginals too, but I want to keep the marginals as-is (i think?) XXX
     ) -> Tuple[pd.Series, pd.Series]:
         """
         Extract type and cohort marginals from DataFrame.
@@ -281,12 +283,13 @@ def interpolate(infile):
         logger.error(msg)
         raise ValueError(msg)
 
-    # Create a snapshot of original data for restoration; retrieve mask for later transforms
-    key_cols = ["census_year", "vintage", "type"]
-    snapshot, dataset = mark_original_data(df, key_cols=key_cols, value_col="dwellings")
+    # create a boolean mask to identify which values were original data or not
+    raw_mask = get_rawdata_mask(df)
 
     # Fill missing values using interpolation
-    interpolated = fill_missing_dwellings(dataset)
+    interpolated = fill_missing_dwellings(df)
+
+    reconciled = reconcile_all_years(interpolated, raw_mask)
 
     # TODO REPRENDRE! NOW I NEED TO APPLY THE FIX MARGINALS and IPFN, WHICH BOTH RELY ON RECONCILE DATA WITH MARGINALS - MAKE SURE IT WORKS WITH THE IS-ORIG FLAG
 
@@ -302,7 +305,7 @@ def interpolate(infile):
 
     # run check_marginals (from dataprep) or a similar function to verify that the marginals are either the same, or closer than they were, after the fill_missing_values
 
-    return interpolated  # , raw_mask
+    return interpolated, raw_mask, reconciled
 
 
 def apply_rawdata_mask(
@@ -325,75 +328,60 @@ def apply_rawdata_mask(
 
     return rawdata_df.where(mask)
 
-
-def mark_original_data(
-    df: pd.DataFrame, value_col: str = "dwellings"
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Mark original (non-NaN) data points to preserve them during interpolation.
-
-    Args:
-        df: DataFrame with data to mark
-        value_col: Column containing values to check for NaN
-
-    Returns:
-        Tuple of (snapshot_df, marked_df) where:
-            - snapshot_df: DataFrame showing which values were originally present
-            - marked_df: Original DataFrame with additional 'is_orig' column
-    """
-    # Create the mask based on non-NaN values in the value column
-    is_original = df[value_col].notna()
-
-    # Create snapshot showing original data availability
-    snapshot = df.copy()
-    snapshot["is_orig"] = is_original
-
-    # Add is_orig column to the main dataframe
-    df_marked = df.copy()
-    df_marked["is_orig"] = is_original
-
-    return snapshot, df_marked
-
-
-def restore_original_data(
-    transformed: pd.DataFrame,
-    orig_snapshot: pd.DataFrame,
-    key_cols=None,
-    value_col: str = "dwellings",
+def get_rawdata_mask(
+    df: pd.DataFrame, by: list[str] = ["census_year", "vintage", "type"]
 ):
     """
-    Reapply original values from orig_snapshot into transformed by key columns.
-    Uses a left merge + combine_first so it works even after group/pivot/indices changes.
+    Compute a boolean mask for the raw data based on non-NaN aggregations.
+
+    This function groups the input DataFrame by the specified columns,
+    sums the numeric data with a minimum count of 1 (so that if all values are NaN, the result
+    remains NaN), resets the index, and then returns a boolean DataFrame, indicating which values
+    contain data (i.e., are not nans)
+
+    Args:
+        df: A pandas DataFrame containing the raw data.
+        by: A list of column names to group by. Defaults to ['census_year', 'vintage', 'type'].
+
+    Returns:
+        A pandas DataFrame of booleans with the same shape as the reset grouped DataFrame,
+        where each True value indicates that the corresponding aggregated value is not NaN.
+
+    Examples:
+        >>> data = {'census_year': [2001, 2001, 2011],
+        ...         'vintage': ['1608-2025', '1608-2025', '1608-1920'],
+        ...         'type': ['total', 'apartments', 'total'],
+        ...         'dwellings': [1000, None, 800]}
+        >>> df = pd.DataFrame(data)
+        >>> get_rawdata_mask(df)
+             census_year vintage      type  dwellings
+        0         2001  1608-2025     total       True
+        1         2001  1608-2025  apartments      False
+        2         2011  1608-1920     total       True
     """
-    if key_cols is None:
-        key_cols = ["census_year", "vintage", "type"]
-    # Ensure keys exist in both frames
-    missing = [
-        k
-        for k in key_cols
-        if k not in transformed.columns or k not in orig_snapshot.columns
-    ]
-    if missing:
-        raise ValueError(f"Missing key columns for restore: {missing}")
-
-    # FIXME instead of restoring, maybe only check/validate if orig data was preserved
-    merged = transformed.merge(
-        orig_snapshot, on=key_cols, how="left", suffixes=("", "_orig")
-    )
-    merged[value_col] = merged[f"{value_col}_orig"].combine_first(merged[value_col])
-    merged.drop(
-        columns=[c for c in merged.columns if c.endswith("_orig")], inplace=True
-    )
-    return merged
+    grouped = df.groupby(by).sum(min_count=1).reset_index()
+    mask = grouped.notna()
+    mask[by] = grouped[by]  # preserve key columns for filtering/pivoting
+    return mask
 
 
-def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
+def fill_missing_dwellings(
+        df: pd.DataFrame,
+        backfill_margin: int = 10,
+        range_start_year: int = 1685,
+    ) -> pd.DataFrame:
     """
     Fill missing dwelling values using backward fill within each (type, vintage) group.
 
-    This function fills NaN values in the 'dwellings' column by looking at future values within the same type and vintage group and propagating them backward.
+    Fills NaN values by propagating the earliest known later-census value backward
+    in time. Forward-fill is applied as a fallback for groups with no earlier
+    non-NaN value. Future vintages (start year > census year) are then zeroed out.
 
-    This sets the minimal dwelling count that must have been built earlier, knowing this dwelling count (by type and vintage) was observed in later censuses.
+    Args:
+        df: DataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns.
+
+    Returns:
+        DataFrame with NaN dwellings filled. Raises ValueError if any NaN remain.
 
     Args:
         df: DataFrame with 'census_year', 'type', 'vintage', and 'dwellings' columns
@@ -412,47 +400,57 @@ def fill_missing_dwellings(df: pd.DataFrame) -> pd.DataFrame:
         >>> filled['dwellings'].isna().sum()
         0
     """
-    # FIXME may break if passed an empty df
-    # Validate input DataFrame
     required_columns = ["census_year", "type", "vintage", "dwellings"]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"DataFrame is missing required columns: {missing_columns}")
 
-    # Group by type and vintage
-    groups = df.groupby(["type", "vintage"])
+    # Sort so bfill propagates from later → earlier census years within each group
+    df = df.sort_values(["type", "vintage", "census_year"]).reset_index(drop=True)
 
-    # Process each group
+    def _vintage_bounds(v: str) -> tuple[int, int]:
+            parts = str(v).split("-")
+            return int(parts[0]), int(parts[1])
+    
     filled_groups = []
-    for name, group in groups:
-        display(group.head(5))  # FIXME remove
-        filled_group = group.copy()
+    for (dw_type, vintage), group in df.groupby(["type", "vintage"], sort=False):
+        s = group.set_index("census_year")["dwellings"]
+        if dw_type == TYPE_TOTAL_LABEL and s.isna().any():
+            start, end = _vintage_bounds(vintage)
+            # Stage A: bfill census years after cohort end
+            post = s.index > end
+            s.loc[post] = s.loc[post].bfill()
+            # Reindex to annual range, zero pre-cohort, index-interpolate
+            upper = end + backfill_margin
+            temp = s.reindex(range(range_start_year, upper + 1))
+            temp.loc[: start - 1] = 0
+            temp = temp.interpolate(method="index")
+            in_range = s.index <= upper
+            s.loc[in_range] = s.loc[in_range].combine_first(temp.loc[s.index[in_range]])
+            s = s.bfill().ffill()  # fallback for anything outside range
+        else:
+            s = s.bfill().ffill()
+        group = group.copy()
+        group["dwellings"] = s.to_numpy()
+        filled_groups.append(group)
+    df = pd.concat(filled_groups, ignore_index=True)
 
-        # TODO FIXME REPRENDRE - here one issue is that since I backfill everything, there may be some categories e.g., single_attached, for which the only available data is very recent; imagine for single_detached, older values were available; then, bfill would project *wrong* values backwards, and would shift the typesplit. I might have to do the 'totals' first, since I have the most data; then do a fix marginals; then bfill? However, doing that would ALSO shift the typesplit. should the bfill interpolation be limited to a given number of sequntial nans? or should I use a combination of ffill/bfill?
+    # Zero out vintages that had not yet been built at the time of the census
+    def _vintage_start(v: str) -> int:
+        try:
+            return int(str(v).split("-")[0])
+        except (ValueError, IndexError):
+            return 0  # "1608-2025" total row → never zeroed
 
-        # Apply backward fill on the dwellings column
-        filled_group["dwellings"] = filled_group["dwellings"].bfill()
-        # FIXME REPRENDRE the backfill is way too high for older data, i.e., data before 19XX. thus, use two passes -- see unfm_fix [ Finalized dataset, 1851-2021]
+    vintage_starts = df["vintage"].map(_vintage_start)
+    df.loc[vintage_starts > df["census_year"], "dwellings"] = 0.0
 
-        # print(filled_group["dwellings"].iloc[-1])  # FIXME logging
-
-        if math.isnan(filled_group["dwellings"].iloc[-1]):
-            # Edge case where the last value of a group was a nan, leading to unfilled values
-            filled_group["dwellings"] = filled_group[
-                "dwellings"
-            ].ffill()  # NOTE-perhaps add a limit? can this cause issues in other datasets?
-
-        filled_groups.append(filled_group)
-
-    # Combine all processed groups
-    result = pd.concat(filled_groups)
-
-    if result.isna().any().any():
-        msg = "Some NaN values remain after filling. Check the input data for completeness."
+    if df["dwellings"].isna().any():
+        msg = "NaN values remain after filling. Check input data for completeness."
         logger.warning(msg)
         raise ValueError(msg)
 
-    return result
+    return df
 
 
 def todo_marginals(df: pd.DataFrame):
@@ -472,9 +470,9 @@ def todo_marginals(df: pd.DataFrame):
         )
         # FIXME | REPRENDRE : THE ORIGINAL DATA MUST BE PROTECTED HERE TOO; I CANT DO ANYTHING TO THE MARGINALS THEMSELVE, AS I ALWAYS HAVE THE DATA. HOWEVER, I SHOULD USE THE SAME BEHAVIOR AS IN "PROTECTING DATA IN IPFN" TO PROTECT ORIGINAL DATA FROM BEING OVERWRITTEN
         # NOTE - I think this will be done automatically throug reconcile_data_wth_marginals
-        new_data, diff = reconcile_data_with_marginals(tsplit)  # HERE pass mask!
+        ipfn_res = reconcile_data_with_marginals(tsplit)  # HERE pass mask!
+        ipfn_df[year] = ipfn_res.result
 
-        ipfn_df[year] = new_data
         # NOTE diff can be useful for documentation; maybe check max/min value to see largest diff?
 
     result = (
@@ -523,6 +521,14 @@ def round_consistent_sum(arr, desired_sum):
     """
     # Convert input to a numpy array of floats
     arr = np.array(arr, dtype=float)
+
+    if (arr < 0).any():
+        raise ValueError("round_consistent_sum requires non-negative values.")
+    desired_sum = int(desired_sum)
+    if arr.sum() == 0:
+        if desired_sum == 0:
+            return [0] * len(arr)
+        raise ValueError("Cannot scale an all-zero array to a nonzero sum.")
 
     current_sum = arr.sum()
 
@@ -593,7 +599,7 @@ def fix_marginals(
         ValueError: If desired_sum is incompatible with protected data
     """
     # Filter and prepare data
-    working_df = MarginalExtractor.filter_columns(df, dw_types, type_total_label, label)
+    working_df = MarginalExtractor.filter_columns(df, dw_types, type_total_label, label,)
 
     # Set default desired sum and ensure it's an integer
     if desired_sum is None:
@@ -623,8 +629,8 @@ def fix_marginals(
 
     # Extract marginals
     type_marginals, cohort_marginals = MarginalExtractor.extract_marginals(
-        working_df, cohort_total_label, type_total_label, replace_zeros=True
-    )
+        working_df, cohort_total_label, type_total_label, replace_zeros=True, zero_replacement=0.1
+    ) # XXX check if putting 0.0 works or not?
 
     # Filter to modifiable parts only
     type_marginals_mod = type_marginals.loc[mod_cols]
@@ -648,7 +654,7 @@ def fix_marginals(
         # Ensure mask aligns with working_df
         aligned_mask = protect_original.reindex(
             index=working_df.index, columns=working_df.columns, fill_value=False
-        ).fillna(False)
+        ).fillna(False).astype(bool)
         interior_protection = aligned_mask.loc[interior_rows, interior_cols]
     else:
         interior_protection = pd.DataFrame(
@@ -746,13 +752,10 @@ def fix_marginals(
     else:
         adj_cohort_marginals = np.ceil(cohort_floors.to_numpy()).astype(int)
 
-    # Ensure floors are respected (safety check)
-    adj_type_marginals = np.maximum(
-        adj_type_marginals, np.ceil(type_floors.to_numpy()).astype(int)
-    )
-    adj_cohort_marginals = np.maximum(
-        adj_cohort_marginals, np.ceil(cohort_floors.to_numpy()).astype(int)
-    )
+    # NOTE: no post-LRM maximum bump — round_consistent_sum guarantees each
+    # vector sums exactly to its budget; clamping afterwards breaks that
+    # invariant and makes the IPFN aggregates mutually inconsistent.
+    # Floor violations are already rejected upstream by the budget checks.
 
     # Calculate differences
     type_diff = adj_type_marginals - type_marginals_mod.to_numpy()
@@ -889,24 +892,21 @@ def reconcile_data_with_marginals(
 
     working_df = marginal_result.adjusted_df
 
-    # # Replace remaining zeros for IPFN
-    # if protect_original is not None:
-    #     working_df = working_df.replace(0, ZERO_REPLACEMENT)
+    # Step 2: Run IPFN — notebook contract: split zero rows/cols out entirely,
+    # IPFN only sees the strictly positive submatrix, zeros re-attached after.
+    interior = working_df.drop(cohort_total_label).drop(type_total_label, axis=1)
+    zero_rows = interior.index[(interior == 0).all(axis=1)]
+    zero_cols = interior.columns[(interior == 0).all(axis=0)]
+    data_matrix = interior.drop(index=zero_rows, columns=zero_cols)
 
-    # Replace zeros for IPFN to avoid division by zero
-    # Store which values were originally zero so we can restore them later if needed
-    zero_mask = working_df == 0  # FIXME unused for now?
-    working_df = working_df.replace(0, zero_replacement)
+    # Seed interior zeros ONLY (mixed rows), never the marginals
+    data_matrix = data_matrix.replace(0, zero_replacement)
 
-    # Step 2: Run IPFN
-    # Extract the data matrix (excluding marginals)
-    data_matrix = working_df.drop(cohort_total_label).drop(type_total_label, axis=1)
-
-    # Extract target marginals
-    cohort_marginals = working_df.drop(cohort_total_label).loc[:, type_total_label]
-    type_marginals = working_df.drop(type_total_label, axis=1).loc[
-        cohort_total_label, :
-    ]
+    # Marginals restricted to the nonzero submatrix — LRM in fix_marginals has
+    # already made both vectors sum exactly to desired_sum; zero rows/cols
+    # contribute 0, so consistency is preserved after the drop.
+    cohort_marginals = working_df.loc[data_matrix.index, type_total_label]
+    type_marginals = working_df.loc[cohort_total_label, data_matrix.columns]
 
     # Store initial values for difference calculation
     initial_matrix = data_matrix.copy()
@@ -926,33 +926,19 @@ def reconcile_data_with_marginals(
         logger.error(f"IPFN failed: {e}")
         raise RuntimeError(f"IPFN processing failed: {e}")
 
-    # Reconstruct the full DataFrame
+    # Round each row to integers that sum exactly to its cohort marginal
+    # (astype(int) floors and silently loses 2-4 units per row)
+    ipfn_df = pd.DataFrame(
+        ipfn_result, index=data_matrix.index, columns=data_matrix.columns
+    )
+    for row in ipfn_df.index:
+        ipfn_df.loc[row, :] = round_consistent_sum(
+            ipfn_df.loc[row, :].to_numpy(), int(cohort_marginals.loc[row])
+        )
+
+    # Reconstruct the full DataFrame; zero rows/cols stay exactly zero
     result = working_df.copy()
-    result.loc[data_matrix.index, data_matrix.columns] = ipfn_result.astype(int)
-
-    # # Calculate difference # TODO delete, DEPRECATED
-    # diff = result.copy().astype(float)
-    # diff.loc[data_matrix.index, data_matrix.columns] = (
-    #     ipfn_result - initial_matrix.to_numpy()
-    # )
-
-    # # If we have protection, restore protected values and zero out their diffs
-    # if protect_original is not None:
-    #     # Restore original protected values
-    #     try:
-    #         result[protect_original] = df.set_index(label)[protect_original]
-    #         diff[protect_original] = 0
-    #     except KeyError as err:
-    #         logger.warning(f"Error: {err}. Attempting without set_index")  # This is because "vintage" might already be in df.index
-    #         result[protect_original] = df[protect_original]
-    #         diff[protect_original] = 0
-
-    # return IPFNResult(
-    #     result=result,
-    #     difference=diff,
-    #     convergence_achieved=converged,
-    #     iterations=iterations,
-    # )
+    result.loc[ipfn_df.index, ipfn_df.columns] = ipfn_df
 
     # Calculate difference BEFORE restoring protected values
     diff = result.copy()
@@ -961,41 +947,14 @@ def reconcile_data_with_marginals(
         - initial_matrix.to_numpy()
     )
 
-    # If we have protection, restore protected values and zero out their diffs
+    # Protection is handled upstream via the aa/bb column split in
+    # reconcile_all_years; overwriting cells after IPFN convergence would
+    # break the row/column sums IPFN just enforced.
     if protect_original is not None:
-        # Align the mask with result DataFrame (same index/columns)
-        aligned_mask = protect_original.reindex(
-            index=result.index, columns=result.columns, fill_value=False
-        ).fillna(False)
-
-        # Get original values aligned with result
-        try:
-            original_aligned = df.set_index(label).reindex(
-                index=result.index, columns=result.columns
-            )
-        except KeyError as err:
-            logger.warning(
-                f"Error: {err}. Attempting without set_index"
-            )  # This is because "vintage" might already be in df.index
-            original_aligned = df.reindex(index=result.index, columns=result.columns)
-
-        # Restore protected values
-        result = result.where(~aligned_mask, original_aligned)
-
-        # Zero out differences for protected values
-        diff = diff.where(~aligned_mask, 0)
-
-    # Restore zeros that should remain zero (where original was zero and not protected)
-    if protect_original is not None:
-        aligned_mask = protect_original.reindex(
-            index=result.index, columns=result.columns, fill_value=False
-        ).fillna(False)
-        # Where originally zero AND not protected, set back to zero
-        should_be_zero = zero_mask & ~aligned_mask
-        result = result.where(~should_be_zero, 0)
-    else:
-        # No protection, restore all original zeros
-        result = result.where(~zero_mask, 0)
+        logger.warning(
+            "protect_original overlay is deprecated; use the two-pass column "
+            "split in reconcile_all_years instead. Mask ignored."
+        )
 
     # Convert final results to integers
     numeric_cols = result.select_dtypes(include=[np.number]).columns
@@ -1011,65 +970,290 @@ def reconcile_data_with_marginals(
         iterations=iterations,
     )
 
+def reconcile_all_years(
+    filled_df: pd.DataFrame,
+    raw_mask: pd.DataFrame,
+    dw_types: list[str] = TARGET_TYPES,
+    type_total_label: str = "total",
+    cohort_total_label: str = "1608-2025",
+) -> pd.DataFrame:
+    """
+    Reconcile interpolated dwelling data for every census year.
+
+    Reproduces the unfm_fix logic from dmfa_dataprep.ipynb using the
+    existing pipeline: fill_missing_dwellings → fix_marginals → apply_ipfn
+    (via reconcile_data_with_marginals).
+
+    For each census year the function:
+    1. Pivots the filled long-format data to wide (vintage × type) — this is
+       required by fix_marginals / apply_ipfn which operate on matrices.
+    2. Builds a matching wide mask so observed cells can be protected.
+    3. Calls reconcile_data_with_marginals (which internally runs
+       fix_marginals then apply_ipfn), passing the mask via
+       ``protect_original``.
+    4. Melts the result back to long format and appends it to the output.
+
+    Args:
+        raw_mask: Boolean mask from get_rawdata_mask (True = observed).
+        dw_types: Target dwelling type columns (must include 'total').
+        type_total_label: Column name for the type total.
+        cohort_total_label: Row label for the cohort total.
+
+    Returns:
+        pd.DataFrame: Long-format DataFrame with columns
+        [census_year, vintage, type, dwellings].
+    """
+    agg_types = [t for t in dw_types if t != type_total_label]
+    reconciled_frames = []
+
+    for census_year, group in filled_df.groupby("census_year"):
+        # --- pivot to wide (needed by fix_marginals / IPFN) ---
+        wide_filled = group.pivot(
+            index="vintage", columns="type", values="dwellings"
+        )
+        present_types = [t for t in dw_types if t in wide_filled.columns]
+
+        # --- build matching wide mask ---
+        mask_group = raw_mask[raw_mask["census_year"] == census_year]
+        wide_mask = mask_group.pivot(
+            index="vintage", columns="type", values="dwellings"
+        )
+        wide_mask = wide_mask.reindex_like(wide_filled).fillna(False).astype(bool)
+
+        # desired_sum must come from the observed grand-total cell
+        if not bool(wide_mask.loc[cohort_total_label, type_total_label]):
+            msg = (
+                f"Grand total cell ({cohort_total_label}, {type_total_label}) "
+                f"is not observed for census_year={census_year}; cannot anchor desired_sum."
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+
+        # --- Stage B (notebook): two-pass reconciliation ---
+        masked = wide_filled[present_types].mask(~wide_mask[present_types])
+        target_cols = masked.isna().any(axis=0)
+        if not target_cols.any():
+            ipfn_res = reconcile_data_with_marginals(
+                wide_filled[present_types], label="vintage", dw_types=dw_types,
+                type_total_label=type_total_label, cohort_total_label=cohort_total_label,
+            )
+            reconciled_wide = ipfn_res.result.copy()
+        else:
+            target_cols[type_total_label] = True
+            aa = wide_filled.loc[:, target_cols[target_cols].index].copy()
+            bb = wide_filled.loc[:, target_cols[~target_cols].index].copy()
+            # remove known columns' contribution from the total marginal
+            aa[type_total_label] = (aa[type_total_label] - bb.sum(axis=1)).clip(lower=0)
+            first = reconcile_data_with_marginals(
+                aa, label="vintage", dw_types=list(aa.columns),
+                type_total_label=type_total_label, cohort_total_label=cohort_total_label,
+            )
+            stitched = pd.concat([first.result.drop(columns=type_total_label), bb], axis=1)
+            stitched = stitched[[c for c in present_types if c != type_total_label]]
+            stitched.insert(0, type_total_label, stitched.sum(axis=1))
+            second = reconcile_data_with_marginals(
+                stitched, label="vintage", dw_types=dw_types,
+                type_total_label=type_total_label, cohort_total_label=cohort_total_label,
+            )
+            ipfn_res = second
+            reconciled_wide = second.result.copy()
+
+        # Recompute totals from components to ensure consistency
+        reconciled_agg = [c for c in agg_types if c in reconciled_wide.columns]
+        reconciled_wide[type_total_label] = reconciled_wide[reconciled_agg].sum(axis=1)
+
+
+        # --- melt back to long format ---
+        df_long = (
+            reconciled_wide.reset_index()
+            .melt(id_vars="vintage", var_name="type", value_name="dwellings")
+        )
+        df_long["census_year"] = census_year
+        reconciled_frames.append(df_long)
+
+    result = pd.concat(reconciled_frames, ignore_index=True)
+    # Reorder columns to match input convention
+
+    return result[["census_year", "vintage", "type", "dwellings"]]
+
 
 if __name__ == "__main__":
     infile = "./data/clean/fulldata.parquet"
-    data, mask = interpolate(infile)
+    filled, raw_mask, reconciled = interpolate(infile)
 
+    print("\n=== Reconciled data (sample) ===")
+    display(reconciled.groupby(by=['census_year','vintage','type']).sum().head(20))
 
-if __name__ == "__main__":
-    infile = "./data/clean/fulldata.parquet"
-    data, mask = interpolate(infile)
-    display(data)
-    display(data.info())
-    display(
-        apply_rawdata_mask(data, mask)
-    )  # TODO use rawdata mask to check the modified values of raw data for quality control
+    print("\n=== Previous data (sample) ===")
+    previous = pd.read_csv("./data/dwellings_1685_2021.csv", usecols=[1,2,3,4])
+    previous.rename(columns={'year':'census_year'}, inplace=True)
+    previous['vintage'] = previous['vintage'].replace({'0-2025':'1608-2025'})
+    display(previous.groupby(by=['census_year','vintage','type']).sum().head(20))
 
-    groups = data.groupby(by=["census_year"])
-    for name, group in groups:
-        print(f"Group: {name}")
+    # Spot-check: census year 1685 - only 1608-1920 should be non-zero
+    yr1685 = reconciled[reconciled["census_year"] == 1685]
+    total_1685 = yr1685[
+        (yr1685["vintage"] == "1608-2025") & (yr1685["type"] == "total")
+    ]["dwellings"].values[0]
+    assert total_1685 > 0, "Total for 1685 should be > 0"
 
-        df = (
-            group.drop("census_year", axis=1)
-            .pivot(index=["vintage"], columns=["type"])
-            .droplevel(axis=1, level=0)
-        )  # droplevel removes 'dwellings' from the columns level: (dwellings, total) -> total
+    post_1920 = yr1685[
+        ~yr1685["vintage"].isin(["1608-2025", "1608-1920"])
+    ]["dwellings"].sum()
+    assert post_1920 == 0, "All vintages after 1920 should be zero for census year 1685"
 
-        cols = [col for col in TARGET_TYPES if col in df]
+    # Visual comparison
+    comparison = pd.merge(reconciled, previous, how='inner', 
+                      on=['census_year','vintage','type'], 
+                      suffixes=('_reconciled', '_previous'))
+    display(comparison.head())
 
-        result, diff = reconcile_data_with_marginals(df)
-        display(
-            df[cols] - result
-        )  # TODO compare masked and unmasked versions!! Should I protect the original data, or not? check copilot, and adjust reconcile.. function accordingly.
+    comparison['difference'] = comparison['dwellings_reconciled'] - comparison['dwellings_previous']
+    comparison['abs_difference'] = comparison['difference'].abs()
+    comparison['pct_difference'] = (comparison['difference'] / comparison['dwellings_previous'] * 100).abs()
+    
+    # Difference Plot 
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # display(group.pivot(index='vintage'))
+    sns.lineplot(data=comparison, x='census_year', y='difference', 
+                hue='type', ax=axes[0])
+    axes[0].set_title('Absolute Difference (Reconciled - Previous)')
+    axes[0].axhline(y=0, color='red', linestyle='--', alpha=0.5)
+    axes[0].set_ylabel('Difference')
 
-# TODO: look at the 'corrected' values, and at everything with "_fix" suffix
-# Realistically, as soon as I start changing the marginals, I can't only change the interpolated data.
+    sns.lineplot(data=comparison, x='census_year', y='pct_difference', 
+                hue='type', ax=axes[1])
+    axes[1].set_title('Absolute % Difference')
+    axes[1].set_ylabel('% Difference')
+
+    plt.tight_layout()
+    plt.savefig('discrepancy_plot.png', dpi=1000, bbox_inches='tight')
+
+    # Scatter plot
+    fig, ax = plt.subplots(figsize=(10, 10))
+    for type_val in comparison['type'].unique():
+        subset = comparison[comparison['type'] == type_val]
+        ax.scatter(subset['dwellings_previous'], subset['dwellings_reconciled'], 
+                label=type_val, alpha=0.6, s=50)
+
+    # Perfect agreement line
+    min_val = comparison[['dwellings_reconciled', 'dwellings_previous']].min().min()
+    max_val = comparison[['dwellings_reconciled', 'dwellings_previous']].max().max()
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect agreement')
+
+    ax.set_xlabel('Previous')
+    ax.set_ylabel('Reconciled')
+    ax.set_title('Reconciled vs Previous Values')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.savefig('scatter_comparison.png', dpi=1000, bbox_inches='tight')
+
+    # Summary statistics
+    comparison_stats = comparison.groupby('type').agg({
+        'difference': ['mean', 'std', 'min', 'max', 'median'],
+        'pct_difference': ['mean', 'median', 'max'],
+        'dwellings_reconciled': 'count'
+    }).round(2)
+
+    print(comparison_stats)
+
+    # By census_year too
+    by_year = comparison.groupby(['census_year', 'type']).agg({
+        'difference': ['mean', 'std'],
+        'pct_difference': ['mean', 'max']
+    }).round(2)
+
+    print(by_year)
+
+    # Correlation analysis
+    correlation = comparison.groupby('type').apply(
+        lambda x: x['dwellings_reconciled'].corr(x['dwellings_previous'])
+    ).round(4)
+
+    print("Correlation (reconciled vs previous):\n", correlation)
+
+    # Detailed comparison table
+    print("\nDetailed Comparison:")
+    print(comparison[['census_year', 'vintage', 'type', 
+                    'dwellings_previous', 'dwellings_reconciled', 
+                    'difference', 'pct_difference']].head(20))
+
 
 # TODO REPRENDRE consider adding the pre-1941 data (cs_data // old_cs_data), then run, and compare results to the initial dataset in a relplot (see previous to last cell in bac/dmfa_dataprep)
 
 
-""" TODO plot the data, and compare with initial parquet dataset. maybe save figures? use a notebook to demonstrate the workflow, print the figures?
-sns.relplot(
-    d,
-    x="year",
-    y="dwellings",
-    hue="type",
-    row="vintage",
-    col="dataset",  # method, 'res' or 'res_fix'
-    kind="line",
-    facet_kws={
-        "sharey": "row",
-    },
-)
+    # HIGHLIGHT LARGE DIFFERENCES (threshold: 1000 dwellings)
+    threshold = 1000
+    large_diffs = comparison[comparison['abs_difference'] >= threshold].copy()
 
-plt.tight_layout()
-plt.show()
+    # Sort by magnitude
+    large_diffs_sorted = large_diffs.sort_values('abs_difference', ascending=False)
 
-# fig, ax = plt.subplots()
-# csdw_itp[(csdw_itp.index.get_level_values('vintage')=='0-2025') & (csdw_itp.index.get_level_values('type').isin(agg_types))].unstack(['type','vintage']).plot(ax=ax, legend=True)
-# sns.move_legend(ax, loc='center left', bbox_to_anchor=[1,0.5])
+    print(f"\n{'='*100}")
+    print(f"LARGE DISCREPANCIES (>= {threshold:,} dwellings): {len(large_diffs_sorted)} records found")
+    print(f"{'='*100}\n")
 
-"""
+    # Display in readable format
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+
+    print(large_diffs_sorted[['census_year', 'vintage', 'type', 
+                            'dwellings_previous', 'dwellings_reconciled', 
+                            'difference', 'pct_difference']].to_string())
+
+    # Summary by group
+    print(f"\n{'='*100}")
+    print("SUMMARY BY CENSUS_YEAR/VINTAGE/TYPE:")
+    print(f"{'='*100}\n")
+
+    summary = large_diffs.groupby(['census_year', 'vintage', 'type']).agg({
+        'abs_difference': ['count', 'sum', 'mean', 'max'],
+        'pct_difference': 'mean'
+    }).round(0)
+
+    summary.columns = ['Count', 'Total_Diff', 'Avg_Diff', 'Max_Diff', 'Avg_Pct_Diff']
+    summary = summary.sort_values('Max_Diff', ascending=False)
+    print(summary.to_string())
+
+    # VISUALIZATION: Heatmap of problem areas
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+    # Heatmap 1: Max difference by census_year and vintage
+    pivot_max = large_diffs.pivot_table(values='abs_difference', 
+                                        index=['vintage', 'type'], 
+                                        columns='census_year', 
+                                        aggfunc='max')
+    sns.heatmap(pivot_max, annot=True, fmt='.0f', cmap='YlOrRd', ax=axes[0], cbar_kws={'label': 'Max Difference'})
+    axes[0].set_title(f'Maximum Dwelling Count Differences (>= {threshold:,}) by Census Year & Vintage')
+
+    # Heatmap 2: Count of problematic records
+    pivot_count = large_diffs.pivot_table(values='abs_difference', 
+                                        index=['vintage', 'type'], 
+                                        columns='census_year', 
+                                        aggfunc='count')
+    sns.heatmap(pivot_count, annot=True, fmt='.0f', cmap='Blues', ax=axes[1], cbar_kws={'label': 'Count of Large Diffs'})
+    axes[1].set_title(f'Number of Large Discrepancies by Census Year & Vintage')
+
+    plt.tight_layout()
+    plt.savefig('large_discrepancies_heatmap.png', dpi=300, bbox_inches='tight')
+
+    # VISUALIZATION: Bar chart sorted by magnitude
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # Group label for readability
+    large_diffs['group'] = (large_diffs['census_year'].astype(str) + '_' + 
+                            large_diffs['vintage'].astype(str) + '_' + 
+                            large_diffs['type'].astype(str))
+
+    top_diffs = large_diffs.nlargest(20, 'abs_difference')
+    sns.barplot(data=top_diffs, x='abs_difference', y='group', palette='Reds_r', ax=ax)
+    ax.set_xlabel(f'Absolute Difference in Dwellings')
+    ax.set_ylabel('Census Year_Vintage_Type')
+    ax.set_title(f'Top 20 Largest Discrepancies (>= {threshold:,} dwellings)')
+
+    for i, v in enumerate(top_diffs['abs_difference']):
+        ax.text(v + 100, i, f'{v:,.0f}', va='center')
+
+    plt.tight_layout()
+    plt.savefig('top_discrepancies.png', dpi=1000, bbox_inches='tight')
