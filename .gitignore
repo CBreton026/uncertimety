@@ -202,3 +202,4 @@ cython_debug/
 .cursorindexingignore
 
 /data/clean/
+/figs

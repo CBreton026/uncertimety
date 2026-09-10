@@ -20,7 +20,7 @@ Appendix 2.1 says that 1941 is first year where "Structural type of dwelling" is
 This [document](https://www150.statcan.gc.ca/n1/en/pub/92-351-u/4198733-eng.pdf?st=NDraLvDI ) discusses availability (and specifics) of the covered dwelling types for 1996, i.e., 1996 (1/5 sample), 1991,* 1986,* 1981, 1976, 1971, 1966, 1961 (1/5 sample). A similar [document](https://publications.gc.ca/collections/collection_2017/statcan/CS99-901-1981-eng.pdf) covers the same for the 1981 census (cf p.92). 
 
 
-Old personal notes:
+Old notes:
 ### Updating with manual info
 
 Changements de définitions dans le temps:
@@ -152,3 +152,29 @@ based on 1991 census:
 1297785-197565+137120 = 1237340
 1237340-1236945 = 395
 basically, the sum of 'apartments' and 'single_attached' are ok; however, the listed 'other_dwelling' count (1297785) is higher than the calculated 'other_dwelling' count (1297390) , by 395 (0.03%), which would 'fit' in a 3e-4 precision.
+
+# On typesplit
+## Notes on typesplit
+- Gilliland et olson décrivent jusqu'à 2/3 de duplex et triplex à montreal vers 1872 (https://www.erudit.org/en/journals/uhr/1998-v26-n2-uhr0659/1016655ar/)
+- several semi-detached in westmount 1905-1915 (https://escholarship.mcgill.ca/concern/parent/n296x0120/file_sets/5138jf92t; file:///C:/Users/chbre37.BLANCHET-10/Downloads/MM67584.PDF). they also discuss the conversion of single-detached and semi-detached to apartments
+- mostly duplexes in montreal 19th century (https://onlinelibrary-wiley-com.acces.bibl.ulaval.ca/doi/epdf/10.1111/j.1541-0064.1986.tb01225.x); they have a table on occupational status that suggest .558 single-detached, and .40% duplexes; not very reliable for my purposes
+
+- in 1931: "Despite the growing favour of multiple-unit dwellings inurban areas, the single house still accommodates by far the largest part of Canada's population.According to the 1931 Census,' 96 p.c. of rural and 59 p.c. of urban households lived in this typeof home'. Of the remaining number of urban househoids, flats and apartments accommodated 26 p.c, semi-detached houses 11 p.c, rows or terraces 3 p.c, and hotels and rooming houses lessthan 1 p.c." AND "Flats in multiple-unit dwellings with private staircases connecting the entrances with thestreet are a feature of Quebec and New Brunswick cities, although not common in other provinces.This kind of dwelling formed a major proportion of apartments and flats in these areas. Of total urban households, apartments and flats accommodated 94 p.c. in Verdun, 86 p.c. in Montreal,78 p.c. in Saint John, 62 p.c in Quebec City and 55 p.c. in Three Rivers."
+
+- for 1931, 'housing in Canada' donne array([0.50386409, 0.08130652, 0.40982717]) 
+
+- Dennis: apartments more common since 1950; there were some before: "In a seminal paper on "The apartment house in urban America," John Hancock identified booms in apartment-house building between 1890 and 1917 and during the 1920s.7  The second of these applies to Canadian as much as to U.S. cities, but the first boom started rather later in a Canada wedded to "cities of homes" and where, until the 1900s, most cities were too small in population to need apartment houses in order to restrict their physical expansion. The only exceptions were Montreal, where the first apartment building (as distinct from a three- or six-unit 'plex) dates from 1889, and Winnipeg, which boasted the fourstorey Westminster Block as early as 1884.8""(https://www.erudit.org/en/journals/uhr/1998-v26-n2-uhr0659/1016656ar.pdf)
+
+- camu 1957 a fait un inventaire pour montréal (https://onlinelibrary-wiley-com.acces.bibl.ulaval.ca/doi/epdf/10.1111/j.1541-0064.1957.tb01807.x)
+
+- early 1900s, mostly single-detached and row houses (https://www-jstor-org.acces.bibl.ulaval.ca/stable/1904304?seq=5).also some very interssting comments on materials
+
+- https://www.thecanadianencyclopedia.ca/en/article/house
+
+- very interesting info here (https://www150.statcan.gc.ca/n1/pub/11-630-x/11-630-x2015007-eng.htm), but Canada only
+
+- Hanna & Dufaux. 2002. Montreal was the canadian metropolis 1840-1960 (https://eppdscrmssa01.blob.core.windows.net/cmhcprodcontainer/sf/project/archive/research/ca1-mh-02m56-w.pdf); in 1842, 52% single-family houses, 48% with two dwellings or more. they note 'sustaining historical conditions behind rental tenure and multi-family dwellings', and a 'rich tradition for medium-density housing'. Citing Lewis, they remark that In 1842, 26% of the houses had more than one dwelling, which counted for 48% of the dwellings. "the building typology changed gradually during the 19th century". several multi-unit flats of 2-6 dwellings built after the fires of 1852. based on Viger Census of 1825, the authors argue a 45.97% single-family dwelling, 54.03 2dwlgs+ in montreal (this is an avg of the parishes 88-12, the suburbs 40-60 and the city 52-48) (p.67). HOWEVER, this says nothing of single-detached vs row vs apartments: "for instance, 3 dwellings on one property could be made either of one building divided in superposed flats or three small rowhouses with no fire walls". The authors do say though that "photographic evidence coupled with investigation of map resources point clearly in the direction of several vernacular duplex and fourplex types". they note in 1760 40% of Qc city lived in 'apartments'. Vers la page 104, plusieurs photos pertinentes. Fig. 4.1 p.118 est intéressante aussi. Regarding fig 4.1, around 1870s, the authors note 'semi-detached was so rare as not even to warrant any inclusion". Chapter 4 also has a lot of info on materials and construction techniques. 50% of all houses built between 1867-1880 were duplexes; this proportion climbs to 60% if we include other multi-family housing. They mention the first triplex was probably built 'not much before 1868'. Table 5 p.155 has some relevant info. 1881-1900: 31.4 single-family, 70 apartments
+
+> Assuming that in 1870, Mtl was 130000 inhabitants, and ~325000 in 1900, this fits with a ~40% urban population in Quebec (prov.) in 1901 (https://statistique.quebec.ca/fr/fichier/retrospective-du-20e-siecle.pdf), and the data found inStone 1967  ~15% urban in 1850, ~36% in 1901 (https://archive.org/details/1961995421967eng/page/28/mode/2up). source similaire dispo ici p.55 (https://numerique.banq.qc.ca/patrimoine/details/52327/2828103?docref=0j61nu7o6oGIP66f2AiPeQ)
+
+Importantly, conversions between dwelling types (e.g., to/from apartments) can occur and influence the typesplit across census years.  
