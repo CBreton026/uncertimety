@@ -1257,3 +1257,7 @@ if __name__ == "__main__":
 
     plt.tight_layout()
     plt.savefig('top_discrepancies.png', dpi=1000, bbox_inches='tight')
+
+    # reconciled.to_parquet('reconciled.parquet')
+    file_path = DATA_DIR / "clean" / "reconciled.parquet" # FIXME ensure dir exists?
+    reconciled.to_parquet(file_path)
